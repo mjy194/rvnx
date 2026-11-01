@@ -1,0 +1,19 @@
+server = "127.0.0.1:7000"
+server_name = "localhost"
+token = "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES"
+tls_ca = "certs/server.pem"
+reconnect_secs = 3
+policy_mode = true
+
+# Fetch this token's policy in memory, validate, then request this exact port.
+[[proxies]]
+name = "web"
+protocol = "tcp"
+local = "127.0.0.1:8000"
+remote_port = 8080
+
+[[proxies]]
+name = "dns"
+protocol = "udp"
+local = "127.0.0.1:5300"
+remote_port = 5353

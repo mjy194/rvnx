@@ -342,3 +342,179 @@ fn server_accepts_legacy_token_or_multiple_tokens_but_not_both() {
         }
     }
 }
+
+fn policy_fixture() -> Policy {
+    Policy {
+        bind_ip: "127.0.0.1".parse().unwrap(),
+        allowed_ports: vec![PortRange {
+            start: 8000,
+            end: 8010,
+        }],
+        protocols: vec![Protocol::Tcp, Protocol::Udp],
+        max_mappings: 2,
+    }
+}
+
+#[test]
+fn policy_config_is_explicit_and_exclusive_with_legacy_mode() {
+    let mut server = server_fixture();
+    assert!(!server.is_policy_mode());
+    server.policies = Some(vec![TokenPolicy {
+        token: "b".repeat(32),
+        policy: policy_fixture(),
+    }]);
+    assert!(server.is_policy_mode());
+    assert!(server.validate().is_err());
+    server.token = None;
+    assert!(server.validate().is_err()); // Static proxies are not a fallback.
+    server.proxies.clear();
+    assert!(server.validate().is_ok());
+    assert_eq!(server.auth_tokens(), vec!["b".repeat(32)]);
+    server.tokens = Some(vec![]);
+    assert!(server.validate().is_err());
+    server.tokens = None;
+    let entry = server.policies.as_ref().unwrap()[0].clone();
+    server.policies.as_mut().unwrap().push(entry);
+    assert!(server.validate().is_err());
+    server.policies.as_mut().unwrap()[1].token = "c".repeat(32);
+    assert!(server.validate().is_ok());
+    server.policies.as_mut().unwrap()[1].token = "short".into();
+    assert!(server.validate().is_err());
+    server.policies = Some(vec![]);
+    assert!(server.validate().is_err());
+    server.token = Some("a".repeat(32));
+    assert!(server.validate().is_err()); // Even an explicit empty list selects policy mode.
+}
+
+#[test]
+fn policy_toml_requires_a_complete_policy_and_hides_credentials_on_wire() {
+    let text = format!(
+        r#"
+        bind = "127.0.0.1:7000"
+        tls_cert = "cert.pem"
+        tls_key = "key.pem"
+        [[policies]]
+        token = "{}"
+        [policies.policy]
+        bind_ip = "127.0.0.1"
+        allowed_ports = [{{ start = 8000, end = 8010 }}]
+        protocols = ["tcp", "udp"]
+        max_mappings = 2
+    "#,
+        "a".repeat(32)
+    );
+    let server: ServerConfig = toml::from_str(&text).unwrap();
+    assert!(server.validate().is_ok());
+    assert!(server.proxies.is_empty());
+    let policy = &server.policies.as_ref().unwrap()[0].policy;
+    let wire = serde_json::to_string(policy).unwrap();
+    assert!(!wire.contains("token"));
+    assert!(!wire.contains(&"a".repeat(32)));
+    assert_eq!(serde_json::from_str::<Policy>(&wire).unwrap(), *policy);
+    for missing in [
+        "bind_ip = \"127.0.0.1\"",
+        "allowed_ports = [{ start = 8000, end = 8010 }]",
+        "protocols = [\"tcp\", \"udp\"]",
+        "max_mappings = 2",
+    ] {
+        assert!(toml::from_str::<ServerConfig>(&text.replace(missing, "")).is_err());
+    }
+    assert!(
+        toml::from_str::<ServerConfig>(
+            &text.replace("max_mappings = 2", "max_mappings = 2\nextra = 1")
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn policy_limits_ranges_and_shared_mapping_validation() {
+    let policy = policy_fixture();
+    assert!(policy.validate().is_ok());
+    for (name, protocol, port, valid) in [
+        ("web", Protocol::Tcp, 8000, true),
+        ("web", Protocol::Udp, 8010, true),
+        ("web", Protocol::Tcp, 7999, false),
+        ("web", Protocol::Tcp, 8011, false),
+        ("web", Protocol::Tcp, 0, false),
+        ("", Protocol::Tcp, 8000, false),
+        ("bad.name", Protocol::Tcp, 8000, false),
+    ] {
+        assert_eq!(
+            policy.validate_mapping(name, &protocol, port).is_ok(),
+            valid
+        );
+    }
+    let mut tcp_only = policy.clone();
+    tcp_only.protocols = vec![Protocol::Tcp];
+    assert!(
+        tcp_only
+            .validate_mapping("web", &Protocol::Udp, 8000)
+            .is_err()
+    );
+    for limit in [0, 4097] {
+        let mut invalid = policy.clone();
+        invalid.max_mappings = limit;
+        assert!(invalid.validate().is_err());
+    }
+    for protocols in [vec![], vec![Protocol::Tcp, Protocol::Tcp]] {
+        let mut invalid = policy.clone();
+        invalid.protocols = protocols;
+        assert!(invalid.validate().is_err());
+    }
+    for ranges in [
+        vec![],
+        vec![PortRange { start: 0, end: 10 }],
+        vec![PortRange { start: 10, end: 9 }],
+        vec![
+            PortRange { start: 10, end: 20 },
+            PortRange { start: 20, end: 30 },
+        ],
+        (1..=129)
+            .map(|port| PortRange {
+                start: port,
+                end: port,
+            })
+            .collect(),
+    ] {
+        let mut invalid = policy.clone();
+        invalid.allowed_ports = ranges;
+        assert!(invalid.validate().is_err());
+    }
+    let mut boundaries = policy;
+    boundaries.max_mappings = 4096;
+    boundaries.allowed_ports = vec![PortRange {
+        start: 1,
+        end: 65535,
+    }];
+    assert!(boundaries.validate().is_ok());
+    assert!(
+        boundaries
+            .validate_mapping("web", &Protocol::Tcp, 65535)
+            .is_ok()
+    );
+}
+
+#[test]
+fn policy_client_requires_explicit_mode_and_exact_nonzero_remote_ports() {
+    let mut client = client_fixture();
+    assert!(!client.policy_mode);
+    assert!(
+        client
+            .proxies
+            .iter()
+            .all(|proxy| proxy.remote_port.is_none())
+    );
+    client.policy_mode = true;
+    assert!(client.validate().is_err());
+    for proxy in &mut client.proxies {
+        proxy.remote_port = Some(8000);
+    }
+    assert!(client.validate().is_ok());
+    client.proxies[0].remote_port = Some(0);
+    assert!(client.validate().is_err());
+    client.proxies[0].remote_port = Some(65535);
+    assert!(client.validate().is_ok());
+    client.policy_mode = false;
+    assert!(client.validate().is_err());
+}

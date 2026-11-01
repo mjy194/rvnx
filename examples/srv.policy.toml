@@ -1,0 +1,16 @@
+# Policy mode: do not configure top-level token, tokens or [[proxies]].
+bind = "0.0.0.0:7000"
+tls_cert = "certs/server.pem"
+tls_key = "certs/server-key.pem"
+cf_probe_enabled = false
+
+# The token itself is the identity. Replacing it creates a different identity.
+# Duplicate tokens are rejected. Use distinct random secrets for more entries.
+[[policies]]
+token = "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES"
+[policies.policy]
+# Clients cannot select or override this address.
+bind_ip = "0.0.0.0"
+allowed_ports = [{ start = 8000, end = 8099 }, { start = 5353, end = 5353 }]
+protocols = ["tcp", "udp"]
+max_mappings = 4

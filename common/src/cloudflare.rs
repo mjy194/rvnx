@@ -1,7 +1,7 @@
 //! Sticky, measured primary/standby connections. Scores belong to TLS connections,
 //! never to an IP cache: redialing requires a fresh measurement.
 use crate::{
-    https::{Connection, HttpsTransport, Tunnel},
+    https::{AuthenticationRejected, Connection, HttpsTransport, Tunnel},
     protocol::Control,
 };
 use anyhow::{Context as _, Result, ensure};
@@ -344,6 +344,8 @@ struct Manager<B = HttpsTransport> {
     next_address: AtomicUsize,
     probe_budget: Mutex<ProbeBudget>,
     probe_bytes: AtomicU64,
+    terminal_auth: bool,
+    auth_rejected: AtomicBool,
 }
 pub struct CfTransport {
     manager: Arc<Manager>,
@@ -351,8 +353,19 @@ pub struct CfTransport {
 }
 impl CfTransport {
     pub fn new(endpoint: HttpsTransport, config: CfConfig) -> Result<Self> {
+        Self::with_auth_policy(endpoint, config, false)
+    }
+    /// Policy mode must surface authentication failures instead of retrying forever.
+    pub fn new_policy(endpoint: HttpsTransport, config: CfConfig) -> Result<Self> {
+        Self::with_auth_policy(endpoint, config, true)
+    }
+    fn with_auth_policy(
+        endpoint: HttpsTransport,
+        config: CfConfig,
+        terminal_auth: bool,
+    ) -> Result<Self> {
         config.validate()?;
-        let manager = Manager::new(endpoint, config);
+        let manager = Manager::with_auth_policy(endpoint, config, terminal_auth);
         let worker = WorkerTask(tokio::spawn(manager.clone().run()));
         Ok(Self {
             manager,
@@ -398,8 +411,14 @@ fn score(samples: &[f64]) -> f64 {
     samples.iter().copied().fold(f64::INFINITY, f64::min)
 }
 impl<B: Backend + 'static> Manager<B> {
+    #[cfg(test)]
     fn new(endpoint: B, config: CfConfig) -> Arc<Self> {
+        Self::with_auth_policy(endpoint, config, false)
+    }
+    fn with_auth_policy(endpoint: B, config: CfConfig, terminal_auth: bool) -> Arc<Self> {
         Arc::new(Self {
+            terminal_auth,
+            auth_rejected: AtomicBool::new(false),
             probe_budget: Mutex::new(ProbeBudget::new(&config, Instant::now())),
             probe_bytes: AtomicU64::new(0),
             config,
@@ -412,12 +431,13 @@ impl<B: Backend + 'static> Manager<B> {
     }
     async fn open(&self, hello: Control) -> Result<Tunnel> {
         let business = matches!(hello, Control::Attach { .. });
-        let lease = timeout(
-            Duration::from_secs(self.config.queue_timeout_secs),
-            self.acquire(business),
-        )
-        .await
-        .context("Cloudflare connection capacity/budget wait timed out")?;
+        let lease = tokio::select! {
+            biased;
+            _ = self.wait_for_auth_rejection() => return Err(AuthenticationRejected.into()),
+            lease = timeout(Duration::from_secs(self.config.queue_timeout_secs), self.acquire(business)) => {
+                lease.context("Cloudflare connection capacity/budget wait timed out")?
+            }
+        };
         let result = self.endpoint.open(&lease.0.connection, hello).await;
         match result {
             Ok(stream) => Ok(Box::new(LeasedStream {
@@ -425,11 +445,45 @@ impl<B: Backend + 'static> Manager<B> {
                 _lease: lease,
             })),
             Err(error) => {
+                self.note_auth_error(&error);
                 lease.0.failed.store(true, Ordering::Relaxed);
                 self.changed.notify_waiters();
                 Err(error)
             }
         }
+    }
+
+    fn note_auth_error(&self, error: &anyhow::Error) {
+        if self.terminal_auth && error.is::<AuthenticationRejected>() {
+            self.auth_rejected.store(true, Ordering::Release);
+            self.changed.notify_waiters();
+        }
+    }
+    async fn wait_for_auth_rejection(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.auth_rejected.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+    async fn download(
+        &self,
+        connection: &Connection,
+        bytes: usize,
+        deadline: Duration,
+    ) -> Result<f64> {
+        if self.auth_rejected.load(Ordering::Acquire) {
+            return Err(AuthenticationRejected.into());
+        }
+        let result = self.endpoint.download(connection, bytes, deadline).await;
+        if let Err(error) = &result {
+            self.note_auth_error(error);
+        }
+        result
     }
 
     fn promote(&self, state: &mut State) {
@@ -525,13 +579,12 @@ impl<B: Backend + 'static> Manager<B> {
             total_bytes = total,
             "CF probe budget charged"
         );
-        self.endpoint
-            .download(
-                &candidate.connection,
-                bytes,
-                Duration::from_secs(self.config.probe_timeout_secs),
-            )
-            .await
+        self.download(
+            &candidate.connection,
+            bytes,
+            Duration::from_secs(self.config.probe_timeout_secs),
+        )
+        .await
     }
 
     async fn dial(
@@ -545,8 +598,7 @@ impl<B: Backend + 'static> Manager<B> {
             Some(slots) => Some(slots.acquire().await?),
             None => None,
         };
-        self.endpoint
-            .download(&connection, 0, Duration::from_secs(10))
+        self.download(&connection, 0, Duration::from_secs(10))
             .await?;
         Ok(Candidate {
             id,
@@ -719,6 +771,8 @@ impl<B: Backend + 'static> Manager<B> {
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                biased;
+                _ = self.wait_for_auth_rejection() => return,
                 _ = tick.tick() => {},
                 _ = self.changed.notified() => {},
                 Some(result) = jobs.join_next(), if !jobs.is_empty() => {
@@ -789,13 +843,13 @@ impl<B: Backend + 'static> Manager<B> {
                     .collect();
                 if !candidates.is_empty() {
                     keeping = true;
-                    let endpoint = self.endpoint.clone();
+                    let manager = self.clone();
                     jobs.spawn(async move {
                         let mut checks = JoinSet::new();
                         for candidate in candidates {
-                            let endpoint = endpoint.clone();
+                            let manager = manager.clone();
                             checks.spawn(async move {
-                                let ok = endpoint
+                                let ok = manager
                                     .download(&candidate.connection, 0, Duration::from_secs(10))
                                     .await
                                     .is_ok();

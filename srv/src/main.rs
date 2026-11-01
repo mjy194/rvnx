@@ -1,8 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -11,7 +14,7 @@ use clap::Parser;
 use rvnx_common::{
     config::{self, Protocol, ServerConfig, ServerProxy},
     https::{self, Tunnel},
-    protocol::{Control, Frame, MAX_DATAGRAM, VERSION, read_control, send_control},
+    protocol::{Control, Frame, MAX_DATAGRAM, POLICY_VERSION, VERSION, read_control, send_control},
     transport::{CONNECT_TIMEOUT, heartbeat_delay, queue, server_tls, spawn_reader, spawn_writer},
 };
 use tokio::{
@@ -24,7 +27,77 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-type Tickets = Arc<Mutex<HashMap<String, oneshot::Sender<Tunnel>>>>;
+type Tickets = Arc<Mutex<HashMap<String, Ticket>>>;
+
+struct Ticket {
+    scope: MappingScope,
+    sender: oneshot::Sender<Tunnel>,
+}
+#[derive(Clone)]
+struct MappingScope {
+    owner: usize,
+    id: u64,
+    active: Arc<AtomicBool>,
+}
+struct Allocation {
+    scope: MappingScope,
+    protocol: Protocol,
+    bind: SocketAddr,
+}
+#[derive(Default)]
+struct Registry {
+    next_id: u64,
+    entries: HashMap<(usize, String), Allocation>,
+}
+impl Registry {
+    fn reserve(
+        &mut self,
+        owner: usize,
+        mapping: &ServerProxy,
+        policy: bool,
+        quota: usize,
+    ) -> std::result::Result<MappingScope, &'static str> {
+        let key = (
+            if policy { owner } else { usize::MAX },
+            mapping.name.clone(),
+        );
+        if self.entries.contains_key(&key) {
+            return Err("name_in_use");
+        }
+        if self
+            .entries
+            .values()
+            .any(|a| a.protocol == mapping.protocol && a.bind == mapping.bind)
+        {
+            return Err("port_in_use");
+        }
+        if policy
+            && self
+                .entries
+                .values()
+                .filter(|a| a.scope.owner == owner)
+                .count()
+                >= quota
+        {
+            return Err("quota_exceeded");
+        }
+        self.next_id = self.next_id.checked_add(1).ok_or("capacity_exhausted")?;
+        let scope = MappingScope {
+            owner,
+            id: self.next_id,
+            active: Arc::new(AtomicBool::new(true)),
+        };
+        self.entries.insert(
+            key,
+            Allocation {
+                scope: scope.clone(),
+                protocol: mapping.protocol,
+                bind: mapping.bind,
+            },
+        );
+        Ok(scope)
+    }
+}
 
 #[derive(Parser)]
 #[command(version, about = "RVNX — Veils Network eXposure server")]
@@ -39,18 +112,30 @@ struct Args {
 struct State {
     config: ServerConfig,
     probes: Option<Arc<Semaphore>>,
-    active: Mutex<HashSet<String>>,
+    active: Mutex<Registry>,
     tickets: Tickets,
 }
 
 struct Registration {
     state: Arc<State>,
     name: String,
+    scope: MappingScope,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        self.state.active.lock().unwrap().remove(&self.name);
+        self.scope.active.store(false, Ordering::SeqCst);
+        self.state
+            .tickets
+            .lock()
+            .unwrap()
+            .retain(|_, ticket| ticket.scope.id != self.scope.id);
+        self.state
+            .active
+            .lock()
+            .unwrap()
+            .entries
+            .retain(|_, allocation| allocation.scope.id != self.scope.id);
         info!(proxy = %self.name, "mapping disconnected");
     }
 }
@@ -82,7 +167,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(State {
         probes: config.cf_probe_enabled.then(|| Arc::new(Semaphore::new(4))),
         config,
-        active: Mutex::new(HashSet::new()),
+        active: Mutex::new(Registry::default()),
         tickets: Arc::new(Mutex::new(HashMap::new())),
     });
     let limit = Arc::new(Semaphore::new(512));
@@ -135,34 +220,83 @@ async fn reject(stream: &mut Tunnel, message: &str) -> Result<()> {
 
 async fn handle_connection(stream: TcpStream, tls: TlsAcceptor, state: Arc<State>) -> Result<()> {
     let handler_state = state.clone();
-    https::dispatch(
-        stream,
-        tls,
-        state.config.auth_tokens(),
-        state.probes.clone(),
-        move |tunnel| {
-            let state = handler_state.clone();
-            async move {
-                if let Err(error) = handle_tunnel(tunnel, state).await {
-                    debug!(%error, "authenticated tunnel ended");
-                }
+    let tokens = state.config.auth_tokens();
+    https::dispatch(stream, tls, &tokens, state.probes.clone(), move |tunnel| {
+        let state = handler_state.clone();
+        async move {
+            if let Err(error) = handle_tunnel(tunnel.tunnel, state, tunnel.identity).await {
+                debug!(%error, "authenticated tunnel ended");
             }
-        },
-    )
+        }
+    })
     .await
 }
 
-async fn handle_tunnel(mut tunnel: Tunnel, state: Arc<State>) -> Result<()> {
-    let hello = timeout(CONNECT_TIMEOUT, read_control(&mut tunnel)).await??;
+async fn mapping_error(
+    tunnel: &mut Tunnel,
+    mapping: &ServerProxy,
+    code: &str,
+    reason: &str,
+) -> Result<()> {
+    let _ = timeout(
+        CONNECT_TIMEOUT,
+        send_control(
+            tunnel,
+            Control::MappingError {
+                proxy: mapping.name.clone(),
+                protocol: mapping.protocol,
+                remote_port: mapping.bind.port(),
+                code: code.into(),
+                reason: reason.into(),
+            },
+        ),
+    )
+    .await;
+    bail!("{code}: {reason}")
+}
+
+async fn handle_tunnel(mut tunnel: Tunnel, state: Arc<State>, owner: usize) -> Result<()> {
+    let mut hello = timeout(CONNECT_TIMEOUT, read_control(&mut tunnel)).await??;
+    let policy_mode = state.config.is_policy_mode();
+    let mut fetched = false;
+    if let Control::GetPolicy { version } = hello {
+        if !policy_mode || version != POLICY_VERSION {
+            return reject(&mut tunnel, "unsupported policy mode or protocol version").await;
+        }
+        let policy = &state.config.policies.as_ref().unwrap()[owner].policy;
+        timeout(
+            CONNECT_TIMEOUT,
+            send_control(
+                &mut tunnel,
+                Control::Policy {
+                    version: POLICY_VERSION,
+                    policy: policy.clone(),
+                },
+            ),
+        )
+        .await??;
+        fetched = true;
+        hello = timeout(CONNECT_TIMEOUT, read_control(&mut tunnel)).await??;
+    }
     match hello {
         Control::Attach { ticket } => {
-            let sender = state.tickets.lock().unwrap().remove(&ticket);
-            let Some(sender) = sender else {
+            // Check ownership BEFORE consuming; a foreign request must not burn a ticket.
+            let entry = {
+                let mut tickets = state.tickets.lock().unwrap();
+                if tickets.get(&ticket).is_some_and(|t| {
+                    t.scope.owner == owner && t.scope.active.load(Ordering::SeqCst)
+                }) {
+                    tickets.remove(&ticket)
+                } else {
+                    None
+                }
+            };
+            let Some(entry) = entry else {
                 return reject(&mut tunnel, "invalid or expired ticket").await;
             };
             timeout(CONNECT_TIMEOUT, send_control(&mut tunnel, Control::Ready)).await??;
             ensure!(
-                sender.send(tunnel).is_ok(),
+                entry.sender.send(tunnel).is_ok(),
                 "public connection already closed"
             );
             Ok(())
@@ -171,7 +305,7 @@ async fn handle_tunnel(mut tunnel: Tunnel, state: Arc<State>) -> Result<()> {
             version,
             proxy,
             protocol,
-        } => {
+        } if !policy_mode => {
             if version != VERSION {
                 return reject(&mut tunnel, "unsupported protocol version").await;
             }
@@ -191,29 +325,153 @@ async fn handle_tunnel(mut tunnel: Tunnel, state: Arc<State>) -> Result<()> {
             if protocol != expected {
                 return reject(&mut tunnel, "proxy protocol mismatch").await;
             }
-            let registered = state.active.lock().unwrap().insert(proxy.clone());
-            if !registered {
+            let reservation =
+                state
+                    .active
+                    .lock()
+                    .unwrap()
+                    .reserve(owner, &mapping, false, usize::MAX);
+            let Ok(scope) = reservation else {
                 return reject(&mut tunnel, "proxy is already connected").await;
-            }
+            };
             let _registration = Registration {
                 state: state.clone(),
                 name: proxy,
+                scope: scope.clone(),
             };
             match mapping.protocol {
-                Protocol::Tcp => serve_tcp(tunnel, mapping, state.tickets.clone()).await,
-                Protocol::Udp => serve_udp(tunnel, mapping).await,
+                Protocol::Tcp => {
+                    serve_tcp(tunnel, mapping, state.tickets.clone(), scope, false).await
+                }
+                Protocol::Udp => serve_udp(tunnel, mapping, false).await,
             }
         }
-        _ => reject(&mut tunnel, "expected register or attach").await,
+        Control::RegisterPolicy {
+            version,
+            proxy,
+            protocol,
+            remote_port,
+        } => {
+            let policy = state
+                .config
+                .policies
+                .as_ref()
+                .and_then(|p| p.get(owner))
+                .map(|p| &p.policy);
+            let mapping = ServerProxy {
+                name: proxy,
+                protocol,
+                bind: SocketAddr::new(
+                    policy.map_or(state.config.bind.ip(), |p| p.bind_ip),
+                    remote_port,
+                ),
+                connection_wait_secs: 10,
+                max_connections: 128,
+                udp_timeout_secs: 60,
+            };
+            if !policy_mode || version != POLICY_VERSION || !fetched {
+                return mapping_error(
+                    &mut tunnel,
+                    &mapping,
+                    "mode_mismatch",
+                    "fetch policy v3 before registering",
+                )
+                .await;
+            }
+            let policy = policy.unwrap();
+            if let Err(error) = policy.validate_mapping(&mapping.name, &protocol, remote_port) {
+                return mapping_error(&mut tunnel, &mapping, "policy_denied", &error.to_string())
+                    .await;
+            }
+            if protocol == Protocol::Tcp && mapping.bind == state.config.bind {
+                return mapping_error(
+                    &mut tunnel,
+                    &mapping,
+                    "port_in_use",
+                    "port conflicts with control listener",
+                )
+                .await;
+            }
+            let reservation =
+                state
+                    .active
+                    .lock()
+                    .unwrap()
+                    .reserve(owner, &mapping, true, policy.max_mappings);
+            let scope = match reservation {
+                Ok(scope) => scope,
+                Err(code) => {
+                    return mapping_error(
+                        &mut tunnel,
+                        &mapping,
+                        code,
+                        "mapping name, port or quota is unavailable",
+                    )
+                    .await;
+                }
+            };
+            let _registration = Registration {
+                state: state.clone(),
+                name: mapping.name.clone(),
+                scope: scope.clone(),
+            };
+            match protocol {
+                Protocol::Tcp => {
+                    serve_tcp(tunnel, mapping, state.tickets.clone(), scope, true).await
+                }
+                Protocol::Udp => serve_udp(tunnel, mapping, true).await,
+            }
+        }
+        _ => {
+            reject(
+                &mut tunnel,
+                "expected register or attach; protocol mode mismatch",
+            )
+            .await
+        }
     }
 }
 
-async fn serve_tcp(mut tunnel: Tunnel, mapping: ServerProxy, tickets: Tickets) -> Result<()> {
+fn ready(mapping: &ServerProxy, policy: bool) -> Control {
+    if policy {
+        Control::Registered {
+            proxy: mapping.name.clone(),
+            protocol: mapping.protocol,
+            remote_port: mapping.bind.port(),
+        }
+    } else {
+        Control::Ready
+    }
+}
+
+async fn serve_tcp(
+    mut tunnel: Tunnel,
+    mapping: ServerProxy,
+    tickets: Tickets,
+    scope: MappingScope,
+    policy: bool,
+) -> Result<()> {
     let listener = match TcpListener::bind(mapping.bind).await {
         Ok(listener) => listener,
-        Err(_) => return reject(&mut tunnel, "cannot bind configured TCP port").await,
+        Err(_) => {
+            return if policy {
+                mapping_error(
+                    &mut tunnel,
+                    &mapping,
+                    "bind_failed",
+                    "cannot bind requested TCP port",
+                )
+                .await
+            } else {
+                reject(&mut tunnel, "cannot bind configured TCP port").await
+            };
+        }
     };
-    timeout(CONNECT_TIMEOUT, send_control(&mut tunnel, Control::Ready)).await??;
+    timeout(
+        CONNECT_TIMEOUT,
+        send_control(&mut tunnel, ready(&mapping, policy)),
+    )
+    .await??;
     info!(proxy = %mapping.name, bind = %mapping.bind, "TCP mapping ready");
     let (reader, writer) = tokio::io::split(tunnel);
     let (mut rx, _reader_task) = spawn_reader(reader);
@@ -230,9 +488,10 @@ async fn serve_tcp(mut tunnel: Tunnel, mapping: ServerProxy, tickets: Tickets) -
                     continue;
                 }
                 let tickets = tickets.clone();
+                let scope = scope.clone();
                 let tx = tx.clone();
                 transfers.spawn(async move {
-                    if let Err(error) = forward_tcp(stream, tickets, tx, Duration::from_secs(mapping.connection_wait_secs)).await {
+                    if let Err(error) = forward_tcp(stream, tickets, tx, Duration::from_secs(mapping.connection_wait_secs), scope).await {
                         debug!(%peer, error = %format!("{error:#}"), "TCP transfer ended");
                     }
                 });
@@ -244,7 +503,10 @@ async fn serve_tcp(mut tunnel: Tunnel, mapping: ServerProxy, tickets: Tickets) -
                 match frame.context("tunnel reader closed")?? {
                     Frame::Control(Control::Ping) => queue(&tx, Frame::Control(Control::Pong)).await?,
                     Frame::Control(Control::Pong) => {}
-                    Frame::Control(Control::Cancel { ticket }) => { tickets.lock().unwrap().remove(&ticket); }
+                    Frame::Control(Control::Cancel { ticket }) => {
+                        let mut entries = tickets.lock().unwrap();
+                        if entries.get(&ticket).is_some_and(|t| t.scope.id == scope.id && t.scope.owner == scope.owner) { entries.remove(&ticket); }
+                    }
                     _ => bail!("unexpected TCP control frame"),
                 }
             }
@@ -261,6 +523,7 @@ async fn forward_tcp(
     tickets: Tickets,
     tx: mpsc::Sender<Frame>,
     wait: Duration,
+    scope: MappingScope,
 ) -> Result<()> {
     public.set_nodelay(true)?;
     let ticket: String = rand::random::<[u8; 32]>()
@@ -268,7 +531,11 @@ async fn forward_tcp(
         .map(|b| format!("{b:02x}"))
         .collect();
     let (sender, receiver) = oneshot::channel();
-    tickets.lock().unwrap().insert(ticket.clone(), sender);
+    {
+        let mut entries = tickets.lock().unwrap();
+        ensure!(scope.active.load(Ordering::SeqCst), "mapping closed");
+        entries.insert(ticket.clone(), Ticket { scope, sender });
+    }
     let _ticket_guard = TicketGuard {
         tickets,
         ticket: ticket.clone(),
@@ -282,12 +549,24 @@ async fn forward_tcp(
     Ok(())
 }
 
-async fn serve_udp(mut tunnel: Tunnel, mapping: ServerProxy) -> Result<()> {
+async fn serve_udp(mut tunnel: Tunnel, mapping: ServerProxy, policy: bool) -> Result<()> {
     let socket = match UdpSocket::bind(mapping.bind).await {
         Ok(socket) => socket,
-        Err(_) => return reject(&mut tunnel, "cannot bind configured UDP port").await,
+        Err(_) => {
+            return if policy {
+                mapping_error(
+                    &mut tunnel,
+                    &mapping,
+                    "bind_failed",
+                    "cannot bind requested UDP port",
+                )
+                .await
+            } else {
+                reject(&mut tunnel, "cannot bind configured UDP port").await
+            };
+        }
     };
-    serve_udp_socket(tunnel, mapping, socket).await
+    serve_udp_socket(tunnel, mapping, socket, policy).await
 }
 
 trait DatagramSocket: Send {
@@ -313,8 +592,13 @@ async fn serve_udp_socket<S: DatagramSocket>(
     mut tunnel: Tunnel,
     mapping: ServerProxy,
     socket: S,
+    policy: bool,
 ) -> Result<()> {
-    timeout(CONNECT_TIMEOUT, send_control(&mut tunnel, Control::Ready)).await??;
+    timeout(
+        CONNECT_TIMEOUT,
+        send_control(&mut tunnel, ready(&mapping, policy)),
+    )
+    .await??;
     info!(proxy = %mapping.name, bind = %mapping.bind, "UDP mapping ready");
     let (reader, writer) = tokio::io::split(tunnel);
     let (mut rx, _reader_task) = spawn_reader(reader);
@@ -376,3 +660,7 @@ async fn serve_udp_socket<S: DatagramSocket>(
 #[cfg(test)]
 #[path = "tests/server.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/policy.rs"]
+mod policy_tests;

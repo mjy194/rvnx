@@ -139,3 +139,67 @@ async fn a_frame_flush_failure_is_reported_even_after_its_bytes_were_written() {
         Control::Ping
     ));
 }
+
+#[tokio::test]
+async fn policy_control_roundtrips_are_explicit_and_preserve_legacy_wire_format() {
+    use crate::config::{Policy, PortRange, Protocol};
+    let policy = Policy {
+        bind_ip: "127.0.0.1".parse().unwrap(),
+        allowed_ports: vec![PortRange {
+            start: 8000,
+            end: 8001,
+        }],
+        protocols: vec![Protocol::Tcp],
+        max_mappings: 2,
+    };
+    for control in [
+        Control::GetPolicy {
+            version: POLICY_VERSION,
+        },
+        Control::Policy {
+            version: POLICY_VERSION,
+            policy,
+        },
+        Control::RegisterPolicy {
+            version: POLICY_VERSION,
+            proxy: "web".into(),
+            protocol: Protocol::Tcp,
+            remote_port: 8000,
+        },
+        Control::Registered {
+            proxy: "web".into(),
+            protocol: Protocol::Tcp,
+            remote_port: 8000,
+        },
+        Control::MappingError {
+            proxy: "web".into(),
+            protocol: Protocol::Tcp,
+            remote_port: 8000,
+            code: "port_in_use".into(),
+            reason: "requested port is occupied".into(),
+        },
+    ] {
+        let expected = serde_json::to_value(&control).unwrap();
+        let mut bytes = Vec::new();
+        send_control(&mut bytes, control).await.unwrap();
+        let actual = read_control(&mut bytes.as_slice()).await.unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+    }
+    assert_eq!(VERSION, 2);
+    let legacy = Control::Register {
+        version: VERSION,
+        proxy: "web".into(),
+        protocol: "tcp".into(),
+    };
+    assert_eq!(
+        serde_json::to_string(&legacy).unwrap(),
+        r#"{"type":"register","version":2,"proxy":"web","protocol":"tcp"}"#
+    );
+    for invalid in [
+        r#"{"type":"register_policy","version":3,"proxy":"web","protocol":"tcp"}"#,
+        r#"{"type":"register_policy","version":3,"proxy":"web","protocol":"icmp","remote_port":8000}"#,
+        r#"{"type":"get_policy","version":3,"token":"unexpected"}"#,
+    ] {
+        assert!(serde_json::from_str::<Control>(invalid).is_err());
+    }
+}

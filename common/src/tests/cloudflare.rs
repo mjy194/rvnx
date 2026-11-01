@@ -121,6 +121,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 #[derive(Clone)]
 enum Step {
     Panic,
+    AuthRejected,
     Speed(f64),
     Fail,
     Block(Arc<Notify>, f64),
@@ -163,6 +164,7 @@ fn connection_id(connection: &Connection) -> usize {
 async fn run_step(step: Step) -> Result<f64> {
     match step {
         Step::Panic => panic!("injected backend panic"),
+        Step::AuthRejected => Err(AuthenticationRejected.into()),
         Step::Speed(speed) => Ok(speed),
         Step::Fail => anyhow::bail!("injected transport failure"),
         Step::BlockFail(gate) => {
@@ -1075,4 +1077,113 @@ async fn authentication_failure_discards_candidate_before_spending_probe_budget(
         (3 * MIB) as u64
     );
     assert_eq!(manager.endpoint.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn policy_authentication_rejection_wakes_all_waiters_and_stops_retrying() {
+    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    manager.endpoint.script.lock().unwrap().authentication = [Step::AuthRejected].into();
+    let mut waiters = JoinSet::new();
+    for _ in 0..3 {
+        let manager = manager.clone();
+        waiters.spawn(async move { manager.open(Control::Ping).await });
+    }
+    settle().await;
+    let worker = run(&manager);
+    settle().await;
+    assert!(worker.0.is_finished());
+    while let Some(result) = waiters.join_next().await {
+        let error = result.unwrap().err().expect("authentication must fail");
+        assert!(error.is::<AuthenticationRejected>());
+    }
+    let attempts = manager.endpoint.script.lock().unwrap().addresses.len();
+    advance(300).await;
+    assert_eq!(
+        manager.endpoint.script.lock().unwrap().addresses.len(),
+        attempts
+    );
+    assert_eq!(manager.probe_bytes.load(Ordering::Relaxed), 0);
+    // Subsequent mapping startup cannot restart the rejected transport implicitly.
+    assert!(
+        manager
+            .open(Control::Ping)
+            .await
+            .err()
+            .unwrap()
+            .is::<AuthenticationRejected>()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_authentication_rejection_remains_candidate_local() {
+    let manager = Manager::new(FakeBackend::default(), test_config());
+    manager.endpoint.script.lock().unwrap().authentication =
+        [Step::AuthRejected, Step::Speed(0.0)].into();
+    let selected = manager.clone().select().await;
+    assert_eq!(selected.len(), 1);
+    assert!(!manager.auth_rejected.load(Ordering::Acquire));
+}
+
+#[tokio::test(start_paused = true)]
+async fn policy_network_failure_remains_retryable() {
+    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    manager.endpoint.script.lock().unwrap().dial_failures = [true, true].into();
+    let _worker = run(&manager);
+    settle().await;
+    assert!(!manager.auth_rejected.load(Ordering::Acquire));
+    advance(manager.config.retry_secs).await;
+    assert!(manager.state.lock().unwrap().primary.is_some());
+    assert!(manager.open(Control::Ping).await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn policy_open_rejection_is_terminal_and_releases_lease() {
+    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    let primary = candidate(&manager, 100, 128).await;
+    manager.state.lock().unwrap().primary = Some(primary.clone());
+    manager.endpoint.script.lock().unwrap().opens = [Step::AuthRejected].into();
+    assert!(
+        manager
+            .open(Control::Ping)
+            .await
+            .err()
+            .unwrap()
+            .is::<AuthenticationRejected>()
+    );
+    assert_eq!(primary.active.load(Ordering::Relaxed), 0);
+    assert!(manager.auth_rejected.load(Ordering::Acquire));
+    assert!(
+        manager
+            .open(Control::Ping)
+            .await
+            .err()
+            .unwrap()
+            .is::<AuthenticationRejected>()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn policy_keepalive_rejection_stops_background_worker() {
+    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    let _worker = run(&manager);
+    settle().await;
+    let primary = manager.state.lock().unwrap().primary.clone().unwrap();
+    let id = connection_id(&primary.connection);
+    manager
+        .endpoint
+        .script
+        .lock()
+        .unwrap()
+        .pings
+        .insert(id, [Step::AuthRejected].into());
+    advance(manager.config.keepalive_secs).await;
+    assert!(_worker.0.is_finished());
+    assert!(
+        manager
+            .open(Control::Ping)
+            .await
+            .err()
+            .unwrap()
+            .is::<AuthenticationRejected>()
+    );
 }

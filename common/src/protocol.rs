@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const VERSION: u16 = 2;
+pub const POLICY_VERSION: u16 = 3;
 pub const MAX_DATAGRAM: usize = 65_507;
 const MAX_CONTROL: usize = 8192;
 const MAX_FRAME: usize = MAX_DATAGRAM + 9;
@@ -10,6 +11,31 @@ const MAX_FRAME: usize = MAX_DATAGRAM + 9;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Control {
+    GetPolicy {
+        version: u16,
+    },
+    Policy {
+        version: u16,
+        policy: crate::config::Policy,
+    },
+    RegisterPolicy {
+        version: u16,
+        proxy: String,
+        protocol: crate::config::Protocol,
+        remote_port: u16,
+    },
+    Registered {
+        proxy: String,
+        protocol: crate::config::Protocol,
+        remote_port: u16,
+    },
+    MappingError {
+        proxy: String,
+        protocol: crate::config::Protocol,
+        remote_port: u16,
+        code: String,
+        reason: String,
+    },
     Register {
         version: u16,
         proxy: String,

@@ -5,8 +5,8 @@ use clap::Parser;
 use rvnx_common::{
     cloudflare::{CfTransport, ClientTransport},
     config::{self, ClientConfig, ClientProxy, Protocol},
-    https::{HttpsTransport, Tunnel},
-    protocol::{Control, Frame, MAX_DATAGRAM, VERSION, read_control},
+    https::{AuthenticationRejected, HttpsTransport, Tunnel},
+    protocol::{Control, Frame, MAX_DATAGRAM, POLICY_VERSION, VERSION, read_control, send_control},
     transport::{CONNECT_TIMEOUT, client_tls, heartbeat_delay, queue, spawn_reader, spawn_writer},
 };
 use tokio::{
@@ -61,9 +61,12 @@ async fn main() -> Result<()> {
                 &config.token,
                 None,
             )?;
-            Ok(Arc::new(ClientTransport::Cloudflare(CfTransport::new(
-                endpoint, cf,
-            )?)))
+            let transport = if config.policy_mode {
+                CfTransport::new_policy(endpoint, cf)?
+            } else {
+                CfTransport::new(endpoint, cf)?
+            };
+            Ok(Arc::new(ClientTransport::Cloudflare(transport)))
         })
         .transpose()?;
     let mut pools = Vec::new();
@@ -112,16 +115,36 @@ async fn main() -> Result<()> {
         let config = config.clone();
         mappings.spawn(async move {
             loop {
-                if let Err(error) = run_mapping(&proxy, &pool).await {
+                if let Err(error) = run_mapping(&proxy, &pool, config.policy_mode).await {
+                    if config.policy_mode && terminal_mapping_error(&error) {
+                        let (code, reason) = if let Some(error) = error.downcast_ref::<TerminalMappingError>() {
+                            (error.code.as_str(), error.reason.as_str())
+                        } else {
+                            ("authentication_rejected", "server rejected authentication")
+                        };
+                        warn!(proxy = %proxy.name, protocol = ?proxy.protocol, remote_port = proxy.remote_port, code, reason, "mapping stopped; configuration must be corrected");
+                        return;
+                    }
                     warn!(proxy = %proxy.name, error = %format!("{error:#}"), "mapping disconnected; reconnecting");
                 }
                 sleep(Duration::from_secs(config.reconnect_secs)).await;
             }
         });
     }
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        result = mappings.join_next() => bail!("mapping worker stopped unexpectedly: {result:?}"),
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            result = mappings.join_next(), if !mappings.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!(%error, "mapping worker stopped unexpectedly; other mappings remain active");
+                }
+                if mappings.is_empty() {
+                    bail!("all mapping workers stopped; correct configuration and restart");
+                }
+            }
+        }
     }
     mappings.shutdown().await;
     info!("RVNX client stopped");
@@ -136,7 +159,103 @@ async fn expect_ready<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
     }
 }
 
-async fn run_mapping(proxy: &ClientProxy, pool: &Arc<ClientTransport>) -> Result<()> {
+#[derive(Debug)]
+struct TerminalMappingError {
+    code: String,
+    reason: String,
+}
+impl std::fmt::Display for TerminalMappingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.reason)
+    }
+}
+impl std::error::Error for TerminalMappingError {}
+fn terminal(code: &str, reason: impl Into<String>) -> anyhow::Error {
+    TerminalMappingError {
+        code: code.into(),
+        reason: reason.into(),
+    }
+    .into()
+}
+fn terminal_mapping_error(error: &anyhow::Error) -> bool {
+    error.is::<TerminalMappingError>() || error.is::<AuthenticationRejected>()
+}
+
+async fn read_policy_control<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Control> {
+    read_control(reader).await.map_err(|error| {
+        if error.is::<std::io::Error>() {
+            error
+        } else {
+            terminal("protocol_mismatch", error.to_string())
+        }
+    })
+}
+
+// The policy lives only within this handshake and is fetched anew after every reconnect.
+async fn policy_handshake<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    tunnel: &mut S,
+    proxy: &ClientProxy,
+) -> Result<()> {
+    let remote_port = proxy
+        .remote_port
+        .ok_or_else(|| terminal("invalid_config", "remote_port is required"))?;
+    let policy = match read_policy_control(tunnel).await? {
+        Control::Policy {
+            version: POLICY_VERSION,
+            policy,
+        } => policy,
+        Control::Error { message } => return Err(terminal("policy_rejected", message)),
+        _ => {
+            return Err(terminal(
+                "protocol_mismatch",
+                "expected policy protocol version 3",
+            ));
+        }
+    };
+    policy
+        .validate()
+        .map_err(|error| terminal("invalid_policy", error.to_string()))?;
+    policy
+        .validate_mapping(&proxy.name, &proxy.protocol, remote_port)
+        .map_err(|error| terminal("policy_denied", error.to_string()))?;
+    send_control(
+        tunnel,
+        Control::RegisterPolicy {
+            version: POLICY_VERSION,
+            proxy: proxy.name.clone(),
+            protocol: proxy.protocol,
+            remote_port,
+        },
+    )
+    .await?;
+    match read_policy_control(tunnel).await? {
+        Control::Registered {
+            proxy: name,
+            protocol,
+            remote_port: port,
+        } if name == proxy.name && protocol == proxy.protocol && port == remote_port => Ok(()),
+        Control::MappingError {
+            proxy: name,
+            protocol,
+            remote_port: port,
+            code,
+            reason,
+        } if name == proxy.name && protocol == proxy.protocol && port == remote_port => {
+            Err(terminal(&code, reason))
+        }
+        Control::Error { message } => Err(terminal("registration_rejected", message)),
+        _ => Err(terminal(
+            "protocol_mismatch",
+            "registration response does not match requested mapping",
+        )),
+    }
+}
+
+async fn run_mapping(
+    proxy: &ClientProxy,
+    pool: &Arc<ClientTransport>,
+    policy_mode: bool,
+) -> Result<()> {
     let udp_target = if proxy.protocol == Protocol::Udp {
         Some(
             timeout(CONNECT_TIMEOUT, lookup_host(&proxy.local))
@@ -147,8 +266,12 @@ async fn run_mapping(proxy: &ClientProxy, pool: &Arc<ClientTransport>) -> Result
     } else {
         None
     };
-    let mut tunnel = pool
-        .open(Control::Register {
+    let hello = if policy_mode {
+        Control::GetPolicy {
+            version: POLICY_VERSION,
+        }
+    } else {
+        Control::Register {
             version: VERSION,
             proxy: proxy.name.clone(),
             protocol: match proxy.protocol {
@@ -156,9 +279,14 @@ async fn run_mapping(proxy: &ClientProxy, pool: &Arc<ClientTransport>) -> Result
                 Protocol::Udp => "udp",
             }
             .into(),
-        })
-        .await?;
-    timeout(CONNECT_TIMEOUT, expect_ready(&mut tunnel)).await??;
+        }
+    };
+    let mut tunnel = pool.open(hello).await?;
+    if policy_mode {
+        timeout(CONNECT_TIMEOUT, policy_handshake(&mut tunnel, proxy)).await??;
+    } else {
+        timeout(CONNECT_TIMEOUT, expect_ready(&mut tunnel)).await??;
+    }
     info!(proxy = %proxy.name, local = %proxy.local, "mapping connected");
     run_session(proxy, pool.clone(), tunnel, udp_target).await
 }

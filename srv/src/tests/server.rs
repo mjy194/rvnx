@@ -1,4 +1,11 @@
 use super::*;
+fn test_scope() -> MappingScope {
+    MappingScope {
+        owner: 0,
+        id: 1,
+        active: Arc::new(AtomicBool::new(true)),
+    }
+}
 
 fn state(protocol: Protocol, bind: SocketAddr) -> Arc<State> {
     Arc::new(State {
@@ -6,6 +13,7 @@ fn state(protocol: Protocol, bind: SocketAddr) -> Arc<State> {
             bind: "127.0.0.1:0".parse().unwrap(),
             token: Some("test".repeat(8)),
             tokens: None,
+            policies: None,
             tls_cert: String::new(),
             tls_key: String::new(),
             cf_probe_enabled: false,
@@ -19,7 +27,7 @@ fn state(protocol: Protocol, bind: SocketAddr) -> Arc<State> {
             }],
         },
         probes: None,
-        active: Mutex::new(HashSet::new()),
+        active: Mutex::new(Registry::default()),
         tickets: Arc::new(Mutex::new(HashMap::new())),
     })
 }
@@ -48,11 +56,13 @@ async fn invalid_initial_message_and_cancelled_ticket_are_rejected_and_removed()
         let hello = if cancelled {
             let (sender, receiver) = oneshot::channel();
             drop(receiver);
-            state
-                .tickets
-                .lock()
-                .unwrap()
-                .insert("cancelled".into(), sender);
+            state.tickets.lock().unwrap().insert(
+                "cancelled".into(),
+                Ticket {
+                    scope: test_scope(),
+                    sender,
+                },
+            );
             Control::Attach {
                 ticket: "cancelled".into(),
             }
@@ -60,7 +70,7 @@ async fn invalid_initial_message_and_cancelled_ticket_are_rejected_and_removed()
             Control::Ping
         };
         let (server, mut peer) = tokio::io::duplex(1024);
-        let worker = tokio::spawn(handle_tunnel(Box::new(server), state.clone()));
+        let worker = tokio::spawn(handle_tunnel(Box::new(server), state.clone(), 0));
         send_control(&mut peer, hello).await.unwrap();
         let reply = read_control(&mut peer).await.unwrap();
         assert!(if cancelled {
@@ -88,13 +98,13 @@ async fn bind_failures_release_registration_for_tcp_and_udp() {
     ] {
         let state = state(protocol, address);
         let (server, mut peer) = tokio::io::duplex(1024);
-        let worker = tokio::spawn(handle_tunnel(Box::new(server), state.clone()));
+        let worker = tokio::spawn(handle_tunnel(Box::new(server), state.clone(), 0));
         register(&mut peer, protocol).await;
         assert!(
             matches!(read_control(&mut peer).await.unwrap(),Control::Error{message} if message.contains("cannot bind"))
         );
         assert!(worker.await.unwrap().is_err());
-        assert!(state.active.lock().unwrap().is_empty());
+        assert!(state.active.lock().unwrap().entries.is_empty());
     }
 }
 
@@ -103,7 +113,7 @@ async fn malformed_mapping_control_releases_registration_and_listener() {
     for protocol in [Protocol::Tcp, Protocol::Udp] {
         let state = state(protocol, "127.0.0.1:0".parse().unwrap());
         let (server, mut peer) = tokio::io::duplex(1024);
-        let worker = tokio::spawn(handle_tunnel(Box::new(server), state.clone()));
+        let worker = tokio::spawn(handle_tunnel(Box::new(server), state.clone(), 0));
         register(&mut peer, protocol).await;
         assert!(matches!(
             read_control(&mut peer).await.unwrap(),
@@ -118,7 +128,7 @@ async fn malformed_mapping_control_releases_registration_and_listener() {
                 .to_string()
                 .contains("unexpected")
         );
-        assert!(state.active.lock().unwrap().is_empty());
+        assert!(state.active.lock().unwrap().entries.is_empty());
     }
 }
 
@@ -137,6 +147,7 @@ async fn pending_public_connection_timeout_and_cancellation_remove_ticket() {
             tickets.clone(),
             tx,
             Duration::from_millis(50),
+            test_scope(),
         ));
         assert!(matches!(
             rx.recv().await,
@@ -216,6 +227,7 @@ async fn udp_writer_failure_stops_mapping_and_releases_registration() {
             failed: failed.clone(),
         }),
         state.clone(),
+        0,
     ));
     register(&mut peer, Protocol::Udp).await;
     assert!(matches!(
@@ -235,7 +247,7 @@ async fn udp_writer_failure_stops_mapping_and_releases_registration() {
         .unwrap()
         .unwrap_err();
     assert!(error.to_string().contains("tunnel writer closed"));
-    assert!(state.active.lock().unwrap().is_empty());
+    assert!(state.active.lock().unwrap().entries.is_empty());
     UdpSocket::bind(address).await.unwrap();
 }
 
@@ -271,6 +283,7 @@ async fn udp_response_send_failure_drops_only_one_packet_and_preserves_mapping()
             socket,
             calls: calls.clone(),
         },
+        false,
     ));
     assert!(matches!(
         read_control(&mut tunnel).await.unwrap(),
@@ -338,7 +351,7 @@ async fn oversized_ipv6_udp_request_and_new_peer_at_capacity_are_dropped() {
     let address = socket.local_addr().unwrap();
     let mapping = state(Protocol::Udp, address).config.proxies[0].clone();
     let (server, mut tunnel) = tokio::io::duplex(4096);
-    let task = tokio::spawn(serve_udp_socket(Box::new(server), mapping, socket));
+    let task = tokio::spawn(serve_udp_socket(Box::new(server), mapping, socket, false));
     assert!(matches!(
         read_control(&mut tunnel).await.unwrap(),
         Control::Ready

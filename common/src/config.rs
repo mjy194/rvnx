@@ -1,9 +1,13 @@
-use std::{collections::HashSet, net::SocketAddr, path::Path};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+    path::Path,
+};
 
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Tcp,
@@ -17,11 +21,98 @@ pub struct ServerConfig {
     /// Legacy single-token form; mutually exclusive with `tokens`.
     pub token: Option<String>,
     pub tokens: Option<Vec<String>>,
+    /// Presence selects policy mode, mutually exclusive with legacy credentials/proxies.
+    pub policies: Option<Vec<TokenPolicy>>,
     pub tls_cert: String,
     pub tls_key: String,
     #[serde(default)]
     pub cf_probe_enabled: bool,
+    #[serde(default)]
     pub proxies: Vec<ServerProxy>,
+}
+
+/// Server-only identity binding. Never send this wrapper to clients or log it.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenPolicy {
+    pub token: String,
+    pub policy: Policy,
+}
+
+/// Complete policy sent to its authenticated owner, without any credentials.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    pub bind_ip: IpAddr,
+    pub allowed_ports: Vec<PortRange>,
+    pub protocols: Vec<Protocol>,
+    pub max_mappings: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl Policy {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=4096).contains(&self.max_mappings),
+            "max_mappings must be in 1..=4096"
+        );
+        ensure!(
+            (1..=128).contains(&self.allowed_ports.len()),
+            "allowed_ports must contain 1..=128 ranges"
+        );
+        let mut ranges: Vec<_> = self.allowed_ports.iter().collect();
+        ranges.sort_by_key(|range| range.start);
+        let mut previous_end = 0;
+        for range in ranges {
+            ensure!(
+                range.start > 0 && range.start <= range.end,
+                "invalid allowed port range"
+            );
+            ensure!(
+                range.start > previous_end,
+                "allowed port ranges must not overlap"
+            );
+            previous_end = range.end;
+        }
+        ensure!(
+            !self.protocols.is_empty(),
+            "at least one protocol is required"
+        );
+        let mut protocols = HashSet::new();
+        for protocol in &self.protocols {
+            ensure!(protocols.insert(protocol), "duplicate policy protocol");
+        }
+        // Leave ample room for the versioned control-message envelope (8192-byte limit).
+        ensure!(
+            serde_json::to_vec(self)?.len() <= 4096,
+            "policy is too large"
+        );
+        Ok(())
+    }
+
+    /// Shared client/server check. The server separately enforces live quota and ownership.
+    pub fn validate_mapping(&self, name: &str, protocol: &Protocol, port: u16) -> Result<()> {
+        validate_name(name, &mut HashSet::new())?;
+        ensure!(
+            self.protocols.contains(protocol),
+            "protocol is not allowed by policy"
+        );
+        ensure!(
+            port != 0
+                && self
+                    .allowed_ports
+                    .iter()
+                    .any(|range| (range.start..=range.end).contains(&port)),
+            "remote port is not allowed by policy"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -41,6 +132,9 @@ pub struct ServerProxy {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
+    /// Explicitly opt in to policy protocol v3; never fall back to legacy registration.
+    #[serde(default)]
+    pub policy_mode: bool,
     pub server: String,
     pub server_name: String,
     pub token: String,
@@ -61,6 +155,7 @@ pub struct ClientConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientProxy {
+    pub remote_port: Option<u16>,
     pub name: String,
     pub protocol: Protocol,
     pub local: String,
@@ -143,16 +238,42 @@ fn validate_limits(limit: usize, timeout: u64) -> Result<()> {
 }
 
 impl ServerConfig {
-    /// Accepted server credentials. Call `validate` before serving requests.
-    pub fn auth_tokens(&self) -> &[String] {
+    pub fn is_policy_mode(&self) -> bool {
+        self.policies.is_some()
+    }
+
+    /// Accepted server credentials, in the same order as `policies` in policy mode.
+    /// Call `validate` before serving requests.
+    pub fn auth_tokens(&self) -> Vec<String> {
+        if let Some(policies) = &self.policies {
+            return policies.iter().map(|entry| entry.token.clone()).collect();
+        }
         match (&self.token, &self.tokens) {
-            (Some(token), None) => std::slice::from_ref(token),
-            (None, Some(tokens)) => tokens,
-            _ => &[],
+            (Some(token), None) => vec![token.clone()],
+            (None, Some(tokens)) => tokens.clone(),
+            _ => vec![],
         }
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(self.bind.port() != 0, "server port cannot be zero");
+        if let Some(policies) = &self.policies {
+            ensure!(
+                self.token.is_none() && self.tokens.is_none() && self.proxies.is_empty(),
+                "policies cannot be combined with legacy token, tokens or proxies"
+            );
+            ensure!(
+                !policies.is_empty(),
+                "at least one token policy is required"
+            );
+            let mut unique = HashSet::new();
+            for entry in policies {
+                validate_token(&entry.token)?;
+                ensure!(unique.insert(&entry.token), "duplicate policy token");
+                entry.policy.validate()?;
+            }
+            return Ok(());
+        }
         ensure!(
             self.token.is_some() != self.tokens.is_some(),
             "configure exactly one of token or tokens"
@@ -160,12 +281,11 @@ impl ServerConfig {
         let tokens = self.auth_tokens();
         ensure!(!tokens.is_empty(), "tokens must not be empty");
         let mut unique = HashSet::new();
-        for token in tokens {
+        for token in &tokens {
             validate_token(token)?;
             ensure!(unique.insert(token), "duplicate token in tokens");
         }
         ensure!(!self.proxies.is_empty(), "at least one proxy is required");
-        ensure!(self.bind.port() != 0, "server port cannot be zero");
         let mut names = HashSet::new();
         let mut binds = HashSet::new();
         for proxy in &self.proxies {
@@ -237,6 +357,11 @@ impl ClientConfig {
             0
         };
         for proxy in &self.proxies {
+            ensure!(
+                self.policy_mode == proxy.remote_port.is_some(),
+                "remote_port is required in policy mode and forbidden in legacy mode"
+            );
+            ensure!(proxy.remote_port != Some(0), "remote_port cannot be zero");
             validate_name(&proxy.name, &mut names)?;
             validate_limits(proxy.max_connections, proxy.udp_timeout_secs)?;
             ensure!(!proxy.local.is_empty(), "local address is required");

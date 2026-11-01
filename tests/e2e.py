@@ -607,6 +607,276 @@ probe_timeout_secs = 10
                 pending.result(timeout=15)
         self.assertTrue(all(count <= 2 for _, count in self.cf_allocations()))
 
+    def policy_server_text(self, policies, probes=False):
+        text = f'''bind = "127.0.0.1:{self.control_port}"
+tls_cert = {json.dumps(str(self.directory / "cert.pem"))}
+tls_key = {json.dumps(str(self.directory / "key.pem"))}
+cf_probe_enabled = {str(probes).lower()}
+'''
+        for token, policy in policies:
+            text += f'''\n[[policies]]
+token = {json.dumps(token)}
+[policies.policy]
+bind_ip = "127.0.0.1"
+allowed_ports = {json.dumps(policy.get("allowed_ports", [{"start": 1024, "end": 65535}])).replace(':', ' =')}
+protocols = {json.dumps(policy.get("protocols", ["tcp", "udp"]))}
+max_mappings = {policy.get("max_mappings", 8)}
+'''
+        # JSON inline object keys are valid TOML quoted keys; separators are '='.
+        return text.replace("cf_probe_enabled = false\n", "")
+
+    def enable_policy(self, policies=None, probes=False):
+        self.stop(self.client)
+        self.stop(self.server)
+        self.policy_other_token = "other-policy-identity-" * 3
+        if policies is None:
+            policies = [(self.token, {}), (self.policy_other_token, {})]
+        (self.directory / "srv.toml").write_text(self.policy_server_text(policies, probes))
+        self.server = self.start("rvnx-srv", "srv.toml")
+        self.wait_for(lambda: self.port_open(self.control_port))
+
+    def policy_tunnel(self, token=None):
+        tunnel = self.tls_connection(token)
+        self.assertEqual(tunnel.status, 200)
+        send_control(tunnel, {"type": "get_policy", "version": 3})
+        response = read_control(tunnel)
+        self.assertEqual(response["type"], "policy")
+        self.assertEqual(response["version"], 3)
+        self.assertNotIn(self.token, json.dumps(response))
+        self.assertNotIn(self.policy_other_token, json.dumps(response))
+        return tunnel, response["policy"]
+
+    def policy_register(self, tunnel, name, port, protocol="tcp", expected="registered"):
+        send_control(tunnel, {"type": "register_policy", "version": 3,
+                              "proxy": name, "protocol": protocol, "remote_port": port})
+        response = read_control(tunnel)
+        self.assertEqual(response["type"], expected, response)
+        for key, value in [("proxy", name), ("protocol", protocol), ("remote_port", port)]:
+            self.assertEqual(response[key], value)
+        if expected == "mapping_error":
+            self.assertTrue(response["code"])
+            self.assertTrue(response["reason"])
+        return response
+
+    def write_policy_client(self, mappings, token=None):
+        text = f'''server = "127.0.0.1:{self.control_port}"
+server_name = "localhost"
+token = {json.dumps(token or self.token)}
+tls_ca = {json.dumps(str(self.directory / "cert.pem"))}
+reconnect_secs = 1
+policy_mode = true
+'''
+        for name, protocol, port in mappings:
+            local_port = (self.tcp_echo if protocol == "tcp" else self.udp_echo).server_address[1]
+            text += f'''\n[[proxies]]
+name = {json.dumps(name)}
+protocol = {json.dumps(protocol)}
+remote_port = {port}
+local = "127.0.0.1:{local_port}"
+'''
+        (self.directory / "clnt.toml").write_text(text)
+
+    def test_policy_is_private_and_no_legacy_or_version_fallback(self):
+        own = {"allowed_ports": [{"start": self.tcp_port, "end": self.tcp_port}],
+               "protocols": ["tcp"], "max_mappings": 1}
+        other = "other-policy-identity-" * 3
+        self.enable_policy([(self.token, own), (other, {"max_mappings": 3})])
+        tunnel, policy = self.policy_tunnel()
+        with tunnel:
+            self.assertEqual(policy["allowed_ports"], own["allowed_ports"])
+            self.assertEqual(policy["protocols"], ["tcp"])
+            self.assertEqual(policy["max_mappings"], 1)
+            error = self.policy_register(tunnel, "denied-protocol", self.tcp_port, "udp", "mapping_error")
+            self.assertEqual(error["code"], "policy_denied")
+        with self.tls_connection() as tunnel:
+            send_control(tunnel, {"type": "register", "version": 2, "proxy": "tcp", "protocol": "tcp"})
+            self.assertEqual(read_control(tunnel)["type"], "error")
+        with self.tls_connection() as tunnel:
+            send_control(tunnel, {"type": "get_policy", "version": 2})
+            self.assertEqual(read_control(tunnel)["type"], "error")
+        with self.tls_connection() as tunnel:
+            error = self.policy_register(tunnel, "no-policy-handshake", self.tcp_port, expected="mapping_error")
+            self.assertEqual(error["code"], "mode_mismatch")
+        denied, _ = self.policy_tunnel()
+        with denied:
+            denied_port = self.tcp_port + 1 if self.tcp_port < 65535 else self.tcp_port - 1
+            error = self.policy_register(denied, "denied-port", denied_port, expected="mapping_error")
+            self.assertEqual(error["code"], "policy_denied")
+        tunnel, _ = self.policy_tunnel()
+        with tunnel:
+            self.policy_register(tunnel, "allowed", self.tcp_port)
+        self.wait_for(lambda: not self.port_open(self.tcp_port))
+
+    def test_policy_names_ports_and_protocol_namespaces(self):
+        self.enable_policy()
+        second_port = free_port()
+        while second_port in (self.tcp_port, self.control_port):
+            second_port = free_port()
+        with ExitStack() as stack:
+            owner, _ = self.policy_tunnel()
+            stack.enter_context(owner)
+            self.policy_register(owner, "shared-name", self.tcp_port)
+            other, _ = self.policy_tunnel(self.policy_other_token)
+            stack.enter_context(other)
+            self.policy_register(other, "shared-name", second_port)
+            duplicate, _ = self.policy_tunnel()
+            with duplicate:
+                self.policy_register(duplicate, "shared-name", free_port(), expected="mapping_error")
+            conflict, _ = self.policy_tunnel(self.policy_other_token)
+            with conflict:
+                self.policy_register(conflict, "different-name", self.tcp_port, expected="mapping_error")
+            udp, _ = self.policy_tunnel()
+            stack.enter_context(udp)
+            self.policy_register(udp, "udp-same-number", self.tcp_port, "udp")
+        self.wait_for(lambda: not self.port_open(self.tcp_port) and not self.port_open(second_port))
+        retry, _ = self.policy_tunnel()
+        with retry:
+            self.policy_register(retry, "shared-name", self.tcp_port)
+
+    def test_policy_quota_and_bind_failure_release_reservations(self):
+        self.enable_policy([(self.token, {"max_mappings": 1})])
+        with socket.socket() as blocker:
+            blocker.bind(("127.0.0.1", 0))
+            blocker.listen()
+            occupied = blocker.getsockname()[1]
+            denied, _ = self.policy_tunnel()
+            with denied:
+                error = self.policy_register(denied, "reusable", occupied, expected="mapping_error")
+                self.assertEqual(error["code"], "bind_failed")
+        owner, _ = self.policy_tunnel()
+        with owner:
+            self.policy_register(owner, "reusable", occupied)
+            denied, _ = self.policy_tunnel()
+            with denied:
+                error = self.policy_register(denied, "over-quota", self.tcp_port, expected="mapping_error")
+                self.assertEqual(error["code"], "quota_exceeded")
+        self.wait_for(lambda: not self.port_open(occupied))
+        retry, _ = self.policy_tunnel()
+        with retry:
+            self.policy_register(retry, "over-quota", self.tcp_port)
+
+    def test_policy_concurrent_registrations_cannot_exceed_quota(self):
+        self.enable_policy([(self.token, {"max_mappings": 1})])
+        first, _ = self.policy_tunnel()
+        second, _ = self.policy_tunnel()
+        barrier = threading.Barrier(2)
+        ports = [self.tcp_port, free_port()]
+        while ports[1] in (ports[0], self.control_port):
+            ports[1] = free_port()
+        def register(index, tunnel):
+            barrier.wait(timeout=5)
+            send_control(tunnel, {"type": "register_policy", "version": 3,
+                                  "proxy": f"racer-{index}", "protocol": "tcp", "remote_port": ports[index]})
+            return read_control(tunnel)
+        with first, second, concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(register, i, tunnel) for i, tunnel in enumerate([first, second])]
+            replies = [f.result(timeout=5) for f in futures]
+            self.assertEqual(sorted(r["type"] for r in replies), ["mapping_error", "registered"])
+            self.assertEqual(sum(self.port_open(port) for port in ports), 1)
+        self.wait_for(lambda: not any(self.port_open(port) for port in ports))
+
+    def test_policy_ticket_owner_cancel_scope_and_disconnect_cleanup(self):
+        self.enable_policy()
+        other_port = free_port()
+        while other_port in (self.tcp_port, self.control_port):
+            other_port = free_port()
+        owner, _ = self.policy_tunnel()
+        other, _ = self.policy_tunnel(self.policy_other_token)
+        with owner, other:
+            self.policy_register(owner, "owned", self.tcp_port)
+            self.policy_register(other, "other", other_port)
+            with socket.create_connection(("127.0.0.1", self.tcp_port), timeout=5) as public:
+                opened = read_control(owner)
+                self.assertEqual(opened["type"], "open")
+                ticket = opened["ticket"]
+                with self.tls_connection(self.policy_other_token) as wrong:
+                    send_control(wrong, {"type": "attach", "ticket": ticket})
+                    self.assertEqual(read_control(wrong)["type"], "error")
+                sibling, _ = self.policy_tunnel()
+                with sibling:
+                    sibling_port = free_port()
+                    while sibling_port in (self.tcp_port, other_port, self.control_port):
+                        sibling_port = free_port()
+                    self.policy_register(sibling, "sibling", sibling_port)
+                    send_control(sibling, {"type": "cancel", "ticket": ticket})
+                    send_control(sibling, {"type": "ping"})
+                    self.assertEqual(read_control(sibling)["type"], "pong")
+                send_control(other, {"type": "cancel", "ticket": ticket})
+                send_control(other, {"type": "ping"})
+                self.assertEqual(read_control(other)["type"], "pong")
+                with self.tls_connection() as attached:
+                    send_control(attached, {"type": "attach", "ticket": ticket})
+                    self.assertEqual(read_control(attached)["type"], "ready")
+                    public.sendall(b"ownership survived")
+                    self.assertEqual(receive_exact(attached, 18), b"ownership survived")
+                    attached.sendall(b"returned")
+                    self.assertEqual(receive_exact(public, 8), b"returned")
+                    with socket.create_connection(("127.0.0.1", self.tcp_port), timeout=5):
+                        pending = read_control(owner)["ticket"]
+                        owner.sock.close()
+                        self.wait_for(lambda: not self.port_open(self.tcp_port))
+                        self.assertEqual(public.recv(1), b"", "mapping teardown must stop existing transfers")
+            with self.tls_connection() as stale:
+                send_control(stale, {"type": "attach", "ticket": pending})
+                self.assertEqual(read_control(stale)["type"], "error")
+
+    def test_policy_client_terminal_mapping_isolation_and_reconnect_policy_refresh(self):
+        own = {"allowed_ports": [{"start": self.tcp_port, "end": self.tcp_port}]}
+        self.enable_policy([(self.token, own)])
+        denied_port = free_port()
+        while denied_port in (self.tcp_port, self.control_port):
+            denied_port = free_port()
+        self.write_policy_client([("tcp", "tcp", self.tcp_port), ("denied", "tcp", denied_port)])
+        log = self.directory / f"rvnx-clnt-{len(self.processes)}.log"
+        self.client = self.start("rvnx-clnt", "clnt.toml")
+        self.wait_for(lambda: self.port_open(self.tcp_port))
+        self.wait_for(lambda: "mapping stopped; configuration must be corrected" in log.read_text())
+        self.tcp_round_trip(b"healthy mapping survives policy denial")
+        self.assertFalse(self.port_open(denied_port))
+        time.sleep(2.2)
+        self.assertIsNone(self.client.poll())
+        self.assertEqual(log.read_text().count("mapping stopped; configuration must be corrected"), 1)
+        before = log.read_text().count("mapping connected")
+        self.stop(self.server)
+        self.server = self.start("rvnx-srv", "srv.toml")
+        self.wait_for(lambda: log.read_text().count("mapping connected") > before)
+        self.tcp_round_trip(b"same requested port after network reconnect")
+        self.stop(self.server)
+        changed = {"allowed_ports": [{"start": denied_port, "end": denied_port}]}
+        (self.directory / "srv.toml").write_text(self.policy_server_text([(self.token, changed)]))
+        self.server = self.start("rvnx-srv", "srv.toml")
+        self.wait_for(lambda: self.port_open(self.control_port))
+        self.wait_for(lambda: self.client.poll() is not None)
+        self.assertEqual(self.client.returncode, 1)
+        self.processes.remove(self.client)  # Expected all-mappings-failed exit, not graceful shutdown.
+        self.assertEqual(log.read_text().count("mapping stopped; configuration must be corrected"), 2)
+        self.assertFalse(self.port_open(self.tcp_port))
+        self.assertFalse(self.port_open(denied_port), "must not silently pick a new remote port")
+        self.assertNotIn(self.token, log.read_text())
+        self.assertFalse(any(self.directory.glob("*policy*.toml")), "fetched policy is memory-only")
+
+    def test_policy_client_authentication_rejection_is_terminal(self):
+        self.enable_policy()
+        self.write_policy_client([("tcp", "tcp", self.tcp_port)], token="unknown-policy-identity-" * 3)
+        log = self.directory / f"rvnx-clnt-{len(self.processes)}.log"
+        self.client = self.start("rvnx-clnt", "clnt.toml")
+        self.wait_for(lambda: self.client.poll() is not None)
+        self.assertEqual(self.client.returncode, 1)
+        self.processes.remove(self.client)
+        self.assertEqual(log.read_text().count("mapping stopped; configuration must be corrected"), 1)
+        self.assertFalse(self.port_open(self.tcp_port))
+
+    def test_policy_client_cloudflare_grpc_and_udp(self):
+        self.enable_policy()
+        self.write_policy_client([("tcp", "tcp", self.tcp_port), ("udp", "udp", self.udp_port)])
+        self.enable_cf()
+        self.wait_for(lambda: self.port_open(self.tcp_port))
+        self.tcp_round_trip(b"policy registration over CF gRPC")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(5)
+            sock.sendto(b"policy UDP", ("127.0.0.1", self.udp_port))
+            self.assertEqual(sock.recv(65535), b"policy UDP")
+
     def test_multiple_server_tokens_and_revocation_after_restart(self):
         self.stop(self.client)
         self.stop(self.server)

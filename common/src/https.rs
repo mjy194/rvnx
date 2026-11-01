@@ -343,6 +343,9 @@ impl HttpsTransport {
             send_control(&mut bytes, hello).await?;
             send.send_data(Bytes::from(bytes), false)?;
             let response = response.await?;
+            if response.status() == StatusCode::NOT_FOUND {
+                return Err(AuthenticationRejected.into());
+            }
             ensure!(
                 response.status() == StatusCode::OK,
                 "HTTPS request rejected ({})",
@@ -376,6 +379,9 @@ impl HttpsTransport {
         let (response, mut send) = sender.send_request(request, false)?;
         send.send_data(grpc::encode(data), end)?;
         let response = response.await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(AuthenticationRejected.into());
+        }
         ensure!(
             response.status() == StatusCode::OK,
             "gRPC request rejected ({})",
@@ -456,19 +462,40 @@ impl HttpsTransport {
     }
 }
 
-fn authorized<B>(request: &Request<B>, tokens: &[String]) -> bool {
+/// Authentication or endpoint/mode mismatch (the server intentionally returns 404).
+#[derive(Debug)]
+pub struct AuthenticationRejected;
+impl std::fmt::Display for AuthenticationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HTTPS/gRPC request rejected (404): authentication or endpoint mismatch"
+        )
+    }
+}
+impl std::error::Error for AuthenticationRejected {}
+
+pub struct AuthenticatedTunnel {
+    pub identity: usize,
+    pub tunnel: Tunnel,
+}
+
+fn authenticated_identity<B>(request: &Request<B>, tokens: &[String]) -> Option<usize> {
     let supplied = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
         .unwrap_or_default();
     // Check every credential without short-circuiting on the matching position.
+    use subtle::ConditionallySelectable;
     let mut valid = subtle::Choice::from(0);
-    for token in tokens {
-        valid |= supplied.ct_eq(token.as_bytes());
+    let mut identity = 0u64;
+    for (index, token) in tokens.iter().enumerate() {
+        let matches = supplied.ct_eq(token.as_bytes());
+        identity = u64::conditional_select(&identity, &(index as u64), matches);
+        valid |= matches;
     }
-    let valid = bool::from(valid);
-    valid && request.method() == http::Method::POST
+    (bool::from(valid) && request.method() == http::Method::POST).then_some(identity as usize)
 }
 
 /// Owns the HTTP connection until closure. All accepted streams are authenticated.
@@ -476,7 +503,7 @@ pub async fn serve(
     stream: TcpStream,
     tls: TlsAcceptor,
     tokens: &[String],
-    accepted: mpsc::Sender<Tunnel>,
+    accepted: mpsc::Sender<AuthenticatedTunnel>,
     probes: Option<Arc<Semaphore>>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
@@ -509,7 +536,7 @@ pub async fn serve(
 async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     tokens: &[String],
-    accepted: mpsc::Sender<Tunnel>,
+    accepted: mpsc::Sender<AuthenticatedTunnel>,
     probes: Option<Arc<Semaphore>>,
 ) -> Result<()> {
     let mut connection = timeout(
@@ -549,7 +576,8 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
             });
         let probe = grpc && path == grpc::DOWNLOAD_PATH;
         let route = path == PATH || (grpc && (!probe || probes.is_some()));
-        if !authorized(&request, tokens) || !route {
+        let identity = authenticated_identity(&request, tokens);
+        if identity.is_none() || !route {
             let headers = Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("content-type", "text/plain; charset=utf-8")
@@ -631,10 +659,13 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
         )?;
         let mut stream = H2Stream::new(request.into_body(), send);
         stream.grpc_response = grpc;
-        permit.send(if grpc {
-            Box::new(GrpcStream::new(stream)) as Tunnel
-        } else {
-            Box::new(stream) as Tunnel
+        permit.send(AuthenticatedTunnel {
+            identity: identity.unwrap(),
+            tunnel: if grpc {
+                Box::new(GrpcStream::new(stream)) as Tunnel
+            } else {
+                Box::new(stream) as Tunnel
+            },
         });
     }
 }
@@ -649,7 +680,7 @@ pub async fn dispatch<F, Fut>(
     handler: F,
 ) -> Result<()>
 where
-    F: Fn(Tunnel) -> Fut,
+    F: Fn(AuthenticatedTunnel) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let (tx, mut rx) = mpsc::channel(128);

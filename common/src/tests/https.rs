@@ -470,8 +470,11 @@ fn authentication_accepts_each_token_and_rejects_missing_or_malformed_headers() 
                 && tokens
                     .iter()
                     .any(|t| header.as_ref() == Some(&format!("Bearer {t}")));
-            assert_eq!(authorized(&request, &tokens), expected);
-            assert!(!authorized(&request, &[]));
+            assert_eq!(
+                authenticated_identity(&request, &tokens).is_some(),
+                expected
+            );
+            assert!(!authenticated_identity(&request, &[]).is_some());
         }
     }
 }
@@ -485,18 +488,20 @@ async fn multiple_tokens_authenticate_every_route_on_the_same_connection() {
         let _ = serve_h2(b, &tokens, tx, Some(Arc::new(Semaphore::new(1)))).await;
     }));
     let connection = client(a).await;
-    for token in ["first-token", "second-token"] {
+    for (identity, token) in ["first-token", "second-token"].into_iter().enumerate() {
         let mut transport = endpoint(Some(1));
         transport.authorization = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
         *transport.slots[0].lock().await = Some(connection.clone());
         let stream = transport.open(Control::Ping).await.unwrap();
         let accepted = rx.recv().await.unwrap();
+        assert_eq!(accepted.identity, identity);
         drop((stream, accepted));
         let stream = transport
             .grpc_request(&connection, grpc::CONNECT_PATH, b"", false)
             .await
             .unwrap();
         let accepted = rx.recv().await.unwrap();
+        assert_eq!(accepted.identity, identity);
         drop((stream, accepted));
         transport
             .download(&connection, 0, Duration::from_secs(2))

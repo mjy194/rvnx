@@ -176,6 +176,7 @@ fn session_fixture(
             name: "test".into(),
             protocol,
             local: "127.0.0.1:1".into(),
+            remote_port: None,
             multiplex: None,
             dedicated_pool_size: None,
             max_connections: 4,
@@ -379,4 +380,146 @@ async fn oversized_ipv6_udp_response_is_dropped_without_ending_the_peer() {
     );
     drop(input);
     task.await.unwrap().unwrap();
+}
+
+fn port_policy(port: u16) -> rvnx_common::config::Policy {
+    rvnx_common::config::Policy {
+        bind_ip: "127.0.0.1".parse().unwrap(),
+        allowed_ports: vec![rvnx_common::config::PortRange {
+            start: port,
+            end: port,
+        }],
+        protocols: vec![Protocol::Tcp],
+        max_mappings: 1,
+    }
+}
+
+#[tokio::test]
+async fn policy_handshake_validates_then_registers_original_port_and_refetches() {
+    let (mut proxy, _, _) = session_fixture(Protocol::Tcp);
+    proxy.remote_port = Some(9000);
+    // Each new control tunnel must present a fresh policy; a previously allowed
+    // port is not reused after a reconnect to a server with a changed policy.
+    for allowed in [true, false] {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let proxy = proxy.clone();
+        let worker = tokio::spawn(async move { policy_handshake(&mut client, &proxy).await });
+        send_control(
+            &mut server,
+            Control::Policy {
+                version: POLICY_VERSION,
+                policy: port_policy(if allowed { 9000 } else { 9001 }),
+            },
+        )
+        .await
+        .unwrap();
+        if allowed {
+            assert!(matches!(read_control(&mut server).await.unwrap(),
+                Control::RegisterPolicy { version: POLICY_VERSION, proxy, protocol: Protocol::Tcp, remote_port: 9000 } if proxy == "test"));
+            send_control(
+                &mut server,
+                Control::Registered {
+                    proxy: "test".into(),
+                    protocol: Protocol::Tcp,
+                    remote_port: 9000,
+                },
+            )
+            .await
+            .unwrap();
+            worker.await.unwrap().unwrap();
+        } else {
+            let error = worker.await.unwrap().unwrap_err();
+            assert!(terminal_mapping_error(&error));
+            assert_eq!(
+                error.downcast_ref::<TerminalMappingError>().unwrap().code,
+                "policy_denied"
+            );
+            // No registration bytes were sent before checking policy.
+            assert!(read_control(&mut server).await.is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn policy_registration_denials_and_mismatched_acknowledgments_are_terminal() {
+    let (mut proxy, _, _) = session_fixture(Protocol::Tcp);
+    proxy.remote_port = Some(9000);
+    for reply in [
+        Control::MappingError {
+            proxy: "test".into(),
+            protocol: Protocol::Tcp,
+            remote_port: 9000,
+            code: "port_in_use".into(),
+            reason: "port already occupied".into(),
+        },
+        Control::Registered {
+            proxy: "test".into(),
+            protocol: Protocol::Tcp,
+            remote_port: 9001,
+        },
+        Control::Registered {
+            proxy: "other".into(),
+            protocol: Protocol::Tcp,
+            remote_port: 9000,
+        },
+        Control::Registered {
+            proxy: "test".into(),
+            protocol: Protocol::Udp,
+            remote_port: 9000,
+        },
+        Control::Ready,
+    ] {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let proxy = proxy.clone();
+        let worker = tokio::spawn(async move { policy_handshake(&mut client, &proxy).await });
+        send_control(
+            &mut server,
+            Control::Policy {
+                version: POLICY_VERSION,
+                policy: port_policy(9000),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_control(&mut server).await.unwrap(),
+            Control::RegisterPolicy { .. }
+        ));
+        send_control(&mut server, reply).await.unwrap();
+        let error = worker.await.unwrap().unwrap_err();
+        assert!(terminal_mapping_error(&error));
+    }
+}
+
+#[tokio::test]
+async fn policy_protocol_errors_are_terminal_but_disconnects_are_retryable() {
+    let (mut proxy, _, _) = session_fixture(Protocol::Tcp);
+    proxy.remote_port = Some(9000);
+    for reply in [
+        Control::Policy {
+            version: VERSION,
+            policy: port_policy(9000),
+        },
+        Control::Ready,
+        Control::Error {
+            message: "policy mode is disabled".into(),
+        },
+    ] {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        send_control(&mut server, reply).await.unwrap();
+        assert!(terminal_mapping_error(
+            &policy_handshake(&mut client, &proxy).await.unwrap_err()
+        ));
+    }
+    let (mut client, server) = tokio::io::duplex(4096);
+    drop(server);
+    assert!(!terminal_mapping_error(
+        &policy_handshake(&mut client, &proxy).await.unwrap_err()
+    ));
+    let malformed = [0, 0, 0, 1, 99];
+    assert!(terminal_mapping_error(
+        &read_policy_control(&mut malformed.as_slice())
+            .await
+            .unwrap_err()
+    ));
 }
