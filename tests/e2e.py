@@ -815,7 +815,7 @@ local = "127.0.0.1:{local_port}"
         with retry:
             self.policy_register(retry, "budget", self.tcp_port)
 
-    def policy_scripted_peer(self, malformed):
+    def policy_scripted_peer(self, malformed=None, future_fields=False):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(str(self.directory / "cert.pem"), str(self.directory / "key.pem"))
         context.set_alpn_protocols(["h2"])
@@ -829,6 +829,11 @@ local = "127.0.0.1:{local_port}"
                         sock.sendall(connection.data_to_send())
                         healthy = {}
                         def respond(stream_id, message):
+                            if handler.server.future_fields:
+                                message["future_hint"] = {"revision": 1, "optional": True}
+                                if message["type"] == "policy":
+                                    message["policy"]["future_hint"] = "ignored metadata"
+                                    message["policy"]["allowed_ports"][0]["future_hint"] = [1, 2]
                             frame = b"\x01" + json.dumps(message).encode()
                             connection.send_data(stream_id, struct.pack("!I", len(frame)) + frame)
                         while data := sock.recv(65536):
@@ -836,7 +841,7 @@ local = "127.0.0.1:{local_port}"
                                 if isinstance(event, h2.events.RequestReceived):
                                     with handler.server.request_lock:
                                         handler.server.requests += 1
-                                        malformed_response = handler.server.requests == 1
+                                        malformed_response = handler.server.malformed is not None and handler.server.requests == 1
                                     connection.send_headers(event.stream_id,
                                         [(":status", "200"), ("content-type", "application/octet-stream")])
                                     if malformed_response:
@@ -866,7 +871,7 @@ local = "127.0.0.1:{local_port}"
                 except (OSError, ssl.SSLError, h2.exceptions.H2Error):
                     pass
         peer = EchoTCP(("127.0.0.1", 0), MalformedHandler)
-        peer.malformed = malformed
+        peer.malformed, peer.future_fields = malformed, future_fields
         peer.requests, peer.request_lock = 0, threading.Lock()
         self.echo_servers.append(peer)
         threading.Thread(target=peer.serve_forever, daemon=True).start()
@@ -892,6 +897,32 @@ local = "127.0.0.1:{local_port}"
                 self.assertEqual(log.read_text().count("mapping stopped; configuration must be corrected"), 1)
                 self.assertEqual(peer.requests, 2, "malformed data must not cause a reconnect loop")
                 self.stop(self.client)
+
+    def test_policy_known_wire_extensions_are_ignored(self):
+        self.enable_policy()
+        with self.tls_connection() as tunnel:
+            send_control(tunnel, {"type": "get_policy", "version": 3, "future_hint": {"optional": True}})
+            self.assertEqual(read_control(tunnel)["type"], "policy")
+            send_control(tunnel, {"type": "register_policy", "version": 3, "proxy": "extensible",
+                                  "protocol": "tcp", "remote_port": self.tcp_port,
+                                  "future_hint": [1, {"metadata": "ignored"}]})
+            self.assertEqual(read_control(tunnel)["type"], "registered")
+        self.wait_for(lambda: not self.port_open(self.tcp_port))
+        # Independent TLS/HTTP2 peer adds fields to Policy, its nested range,
+        # and Registered; the real client must preserve known-field semantics.
+        peer = self.policy_scripted_peer(future_fields=True)
+        self.write_policy_client([("extensible", "tcp", self.tcp_port)])
+        config = self.directory / "clnt.toml"
+        config.write_text(config.read_text().replace(
+            f'server = "127.0.0.1:{self.control_port}"',
+            f'server = "127.0.0.1:{peer.server_address[1]}"'))
+        log = self.directory / f"rvnx-clnt-{len(self.processes)}.log"
+        self.client = self.start("rvnx-clnt", "clnt.toml")
+        self.wait_for(lambda: "mapping connected" in log.read_text())
+        time.sleep(1.2)
+        self.assertIsNone(self.client.poll())
+        self.assertNotIn("mapping stopped", log.read_text())
+        self.assertEqual(peer.requests, 1)
 
     def test_policy_ticket_owner_cancel_scope_and_disconnect_cleanup(self):
         self.enable_policy()

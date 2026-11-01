@@ -9,13 +9,14 @@ const MAX_CONTROL: usize = 8192;
 const MAX_FRAME: usize = MAX_DATAGRAM + 9;
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
     GetPolicy {
         version: u16,
     },
     Policy {
         version: u16,
+        #[serde(deserialize_with = "deserialize_wire_policy")]
         policy: crate::config::Policy,
     },
     RegisterPolicy {
@@ -59,6 +60,40 @@ pub enum Control {
     },
     Ping,
     Pong,
+}
+
+// Wire objects tolerate additive fields. Keep these DTOs separate from the strict
+// local TOML policy structs so configuration typos are never silently accepted.
+fn deserialize_wire_policy<'de, D>(deserializer: D) -> Result<crate::config::Policy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct WirePortRange {
+        start: u16,
+        end: u16,
+    }
+    #[derive(Deserialize)]
+    struct WirePolicy {
+        bind_ip: std::net::IpAddr,
+        allowed_ports: Vec<WirePortRange>,
+        protocols: Vec<crate::config::Protocol>,
+        max_mappings: usize,
+    }
+    let wire = WirePolicy::deserialize(deserializer)?;
+    Ok(crate::config::Policy {
+        bind_ip: wire.bind_ip,
+        allowed_ports: wire
+            .allowed_ports
+            .into_iter()
+            .map(|range| crate::config::PortRange {
+                start: range.start,
+                end: range.end,
+            })
+            .collect(),
+        protocols: wire.protocols,
+        max_mappings: wire.max_mappings,
+    })
 }
 
 #[derive(Debug)]

@@ -50,10 +50,7 @@ async fn control_parser_rejects_datagrams_and_invalid_control_payloads() {
             .to_string()
             .contains("expected a control")
     );
-    for json in [
-        b"{".as_slice(),
-        br#"{"type":"attach","ticket":"t","extra":true}"#,
-    ] {
+    for json in [b"{".as_slice(), br#"{"type":"attach","extra":true}"#] {
         let mut bytes = ((json.len() + 1) as u32).to_be_bytes().to_vec();
         bytes.push(1);
         bytes.extend_from_slice(json);
@@ -198,7 +195,7 @@ async fn policy_control_roundtrips_are_explicit_and_preserve_legacy_wire_format(
     for invalid in [
         r#"{"type":"register_policy","version":3,"proxy":"web","protocol":"tcp"}"#,
         r#"{"type":"register_policy","version":3,"proxy":"web","protocol":"icmp","remote_port":8000}"#,
-        r#"{"type":"get_policy","version":3,"token":"unexpected"}"#,
+        r#"{"type":"get_policy","version":"3","future":true}"#,
     ] {
         assert!(serde_json::from_str::<Control>(invalid).is_err());
     }
@@ -240,6 +237,107 @@ async fn open_budget_is_optional_and_legacy_encoding_is_unchanged() {
         r#"{"type":"open","ticket":"ticket","timeout_ms":1.5}"#,
         r#"{"type":"open","ticket":"ticket","timeout_ms":"1000"}"#,
         r#"{"type":"open","ticket":"ticket","timeout_ms":18446744073709551616}"#,
+    ] {
+        assert!(serde_json::from_str::<Control>(invalid).is_err());
+    }
+}
+
+#[tokio::test]
+async fn known_wire_messages_ignore_additive_fields_at_every_object_level() {
+    let messages = [
+        r#"{"type":"get_policy","version":3}"#,
+        r#"{"type":"policy","version":3,"policy":{"bind_ip":"127.0.0.1","allowed_ports":[{"start":8000,"end":8010}],"protocols":["tcp"],"max_mappings":2}}"#,
+        r#"{"type":"register_policy","version":3,"proxy":"web","protocol":"tcp","remote_port":8000}"#,
+        r#"{"type":"registered","proxy":"web","protocol":"tcp","remote_port":8000}"#,
+        r#"{"type":"mapping_error","proxy":"web","protocol":"tcp","remote_port":8000,"code":"denied","reason":"not allowed"}"#,
+        r#"{"type":"register","version":2,"proxy":"web","protocol":"tcp"}"#,
+        r#"{"type":"attach","ticket":"ticket"}"#,
+        r#"{"type":"ready"}"#,
+        r#"{"type":"error","message":"rejected"}"#,
+        r#"{"type":"open","ticket":"ticket"}"#,
+        r#"{"type":"cancel","ticket":"ticket"}"#,
+        r#"{"type":"ping"}"#,
+        r#"{"type":"pong"}"#,
+    ];
+    for json in messages {
+        let original: Control = serde_json::from_str(json).unwrap();
+        let expected = serde_json::to_value(original).unwrap();
+        let mut extended: serde_json::Value = serde_json::from_str(json).unwrap();
+        extended["future"] = serde_json::json!({"nested": [true, 17, null]});
+        if let Some(policy) = extended.get_mut("policy") {
+            policy["future_permission"] = serde_json::json!({"mode": "additive"});
+            policy["allowed_ports"][0]["future_range_label"] = serde_json::json!("web");
+        }
+        let json = serde_json::to_vec(&extended).unwrap();
+        let mut bytes = ((json.len() + 1) as u32).to_be_bytes().to_vec();
+        bytes.push(1);
+        bytes.extend_from_slice(&json);
+        let parsed = read_control(&mut bytes.as_slice()).await.unwrap();
+        if let Control::Policy { policy, .. } = &parsed {
+            policy.validate().unwrap();
+            assert!(
+                policy
+                    .validate_mapping("web", &crate::config::Protocol::Tcp, 8000)
+                    .is_ok()
+            );
+            assert!(
+                policy
+                    .validate_mapping("web", &crate::config::Protocol::Tcp, 9000)
+                    .is_err()
+            );
+        }
+        assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
+    }
+}
+
+#[test]
+fn tolerant_wire_policy_still_requires_known_fields_types_and_validation() {
+    let valid = serde_json::json!({
+        "type": "policy", "version": 3,
+        "policy": {"bind_ip": "127.0.0.1", "allowed_ports": [{"start": 8000, "end": 8010}], "protocols": ["tcp"], "max_mappings": 2}
+    });
+    for field in ["bind_ip", "allowed_ports", "protocols", "max_mappings"] {
+        let mut value = valid.clone();
+        value["policy"].as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<Control>(value).is_err());
+    }
+    for field in ["start", "end"] {
+        let mut value = valid.clone();
+        value["policy"]["allowed_ports"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(serde_json::from_value::<Control>(value).is_err());
+        let mut value = valid.clone();
+        value["policy"]["allowed_ports"][0][field] = serde_json::json!("8000");
+        assert!(serde_json::from_value::<Control>(value).is_err());
+    }
+    for (field, wrong) in [
+        ("bind_ip", serde_json::json!("invalid address")),
+        (
+            "allowed_ports",
+            serde_json::json!({"start": 8000, "end": 8010}),
+        ),
+        ("protocols", serde_json::json!(["icmp"])),
+        ("max_mappings", serde_json::json!("2")),
+    ] {
+        let mut value = valid.clone();
+        value["policy"][field] = wrong;
+        assert!(serde_json::from_value::<Control>(value).is_err());
+    }
+    let mut invalid_known = valid.clone();
+    invalid_known["policy"]["max_mappings"] = serde_json::json!(0);
+    invalid_known["policy"]["future"] = serde_json::json!(true);
+    let Control::Policy { policy, .. } = serde_json::from_value::<Control>(invalid_known).unwrap()
+    else {
+        panic!()
+    };
+    assert!(policy.validate().is_err());
+    for invalid in [
+        r#"{"type":"future_message","version":3}"#,
+        r#"{"type":"get_policy","future":true}"#,
+        r#"{"type":"attach","ticket":42,"future":true}"#,
+        r#"{"type":"register_policy","version":3,"proxy":"web","protocol":"tcp","remote_port":"8000"}"#,
     ] {
         assert!(serde_json::from_str::<Control>(invalid).is_err());
     }

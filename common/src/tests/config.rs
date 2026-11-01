@@ -574,3 +574,38 @@ fn server_setup_budget_defaults_and_bounds_do_not_change_policy_or_legacy_mappin
     assert_eq!(explicit.connection_wait_secs, 42);
     assert!(explicit.validate().is_ok());
 }
+
+#[test]
+fn local_toml_remains_strict_at_server_policy_and_port_range_levels() {
+    let text = format!(
+        r#"
+        bind = "127.0.0.1:7000"
+        tls_cert = "cert.pem"
+        tls_key = "key.pem"
+        [[policies]]
+        token = "{}"
+        [policies.policy]
+        bind_ip = "127.0.0.1"
+        allowed_ports = [{{ start = 8000, end = 8010 }}]
+        protocols = ["tcp"]
+        max_mappings = 2
+    "#,
+        "a".repeat(32)
+    );
+    assert!(
+        toml::from_str::<ServerConfig>(&text)
+            .unwrap()
+            .validate()
+            .is_ok()
+    );
+    for invalid in [
+        format!("future = true\n{text}"),
+        text.replace("[[policies]]", "[[policies]]\nfuture = true"),
+        text.replace("[policies.policy]", "[policies.policy]\nfuture = true"),
+        text.replace("end = 8010", "end = 8010, future = true"),
+        text.replace("max_mappings", "max_mapings"),
+        text.replace("start = 8000", "strat = 8000"),
+    ] {
+        assert!(toml::from_str::<ServerConfig>(&invalid).is_err());
+    }
+}
