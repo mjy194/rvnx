@@ -97,7 +97,11 @@ pub fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
         loop {
             let frame = match timeout(IDLE_TIMEOUT, read_frame(&mut reader)).await {
                 Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!("tunnel heartbeat timed out")),
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "tunnel heartbeat timed out",
+                )
+                .into()),
             };
             let failed = frame.is_err();
             if tx.send(frame).await.is_err() || failed {

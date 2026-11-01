@@ -335,6 +335,20 @@ impl Drop for WorkerTask {
         self.0.abort();
     }
 }
+enum TerminalFailure {
+    Authentication,
+    Protocol(String),
+}
+impl TerminalFailure {
+    fn error(&self) -> anyhow::Error {
+        match self {
+            Self::Authentication => AuthenticationRejected.into(),
+            Self::Protocol(reason) => {
+                io::Error::new(io::ErrorKind::InvalidData, reason.clone()).into()
+            }
+        }
+    }
+}
 struct Manager<B = HttpsTransport> {
     config: CfConfig,
     endpoint: Arc<B>,
@@ -344,8 +358,8 @@ struct Manager<B = HttpsTransport> {
     next_address: AtomicUsize,
     probe_budget: Mutex<ProbeBudget>,
     probe_bytes: AtomicU64,
-    terminal_auth: bool,
-    auth_rejected: AtomicBool,
+    terminal_errors: bool,
+    terminal_failure: Mutex<Option<TerminalFailure>>,
 }
 pub struct CfTransport {
     manager: Arc<Manager>,
@@ -353,19 +367,19 @@ pub struct CfTransport {
 }
 impl CfTransport {
     pub fn new(endpoint: HttpsTransport, config: CfConfig) -> Result<Self> {
-        Self::with_auth_policy(endpoint, config, false)
+        Self::with_error_policy(endpoint, config, false)
     }
-    /// Policy mode must surface authentication failures instead of retrying forever.
+    /// Policy mode stops retrying definite authentication and protocol failures.
     pub fn new_policy(endpoint: HttpsTransport, config: CfConfig) -> Result<Self> {
-        Self::with_auth_policy(endpoint, config, true)
+        Self::with_error_policy(endpoint, config, true)
     }
-    fn with_auth_policy(
+    fn with_error_policy(
         endpoint: HttpsTransport,
         config: CfConfig,
-        terminal_auth: bool,
+        terminal_errors: bool,
     ) -> Result<Self> {
         config.validate()?;
-        let manager = Manager::with_auth_policy(endpoint, config, terminal_auth);
+        let manager = Manager::with_error_policy(endpoint, config, terminal_errors);
         let worker = WorkerTask(tokio::spawn(manager.clone().run()));
         Ok(Self {
             manager,
@@ -413,12 +427,12 @@ fn score(samples: &[f64]) -> f64 {
 impl<B: Backend + 'static> Manager<B> {
     #[cfg(test)]
     fn new(endpoint: B, config: CfConfig) -> Arc<Self> {
-        Self::with_auth_policy(endpoint, config, false)
+        Self::with_error_policy(endpoint, config, false)
     }
-    fn with_auth_policy(endpoint: B, config: CfConfig, terminal_auth: bool) -> Arc<Self> {
+    fn with_error_policy(endpoint: B, config: CfConfig, terminal_errors: bool) -> Arc<Self> {
         Arc::new(Self {
-            terminal_auth,
-            auth_rejected: AtomicBool::new(false),
+            terminal_errors,
+            terminal_failure: Mutex::new(None),
             probe_budget: Mutex::new(ProbeBudget::new(&config, Instant::now())),
             probe_bytes: AtomicU64::new(0),
             config,
@@ -433,7 +447,7 @@ impl<B: Backend + 'static> Manager<B> {
         let business = matches!(hello, Control::Attach { .. });
         let lease = tokio::select! {
             biased;
-            _ = self.wait_for_auth_rejection() => return Err(AuthenticationRejected.into()),
+            error = self.wait_for_terminal_error() => return Err(error),
             lease = timeout(Duration::from_secs(self.config.queue_timeout_secs), self.acquire(business)) => {
                 lease.context("Cloudflare connection capacity/budget wait timed out")?
             }
@@ -445,7 +459,7 @@ impl<B: Backend + 'static> Manager<B> {
                 _lease: lease,
             })),
             Err(error) => {
-                self.note_auth_error(&error);
+                self.note_terminal_error(&error);
                 lease.0.failed.store(true, Ordering::Relaxed);
                 self.changed.notify_waiters();
                 Err(error)
@@ -453,19 +467,40 @@ impl<B: Backend + 'static> Manager<B> {
         }
     }
 
-    fn note_auth_error(&self, error: &anyhow::Error) {
-        if self.terminal_auth && error.is::<AuthenticationRejected>() {
-            self.auth_rejected.store(true, Ordering::Release);
+    fn note_terminal_error(&self, error: &anyhow::Error) {
+        if !self.terminal_errors {
+            return;
+        }
+        let failure = if error.is::<AuthenticationRejected>() {
+            Some(TerminalFailure::Authentication)
+        } else if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::InvalidData)
+        {
+            Some(TerminalFailure::Protocol(format!("{error:#}")))
+        } else {
+            None
+        };
+        if let Some(failure) = failure {
+            // Preserve the first definite error for every waiting/new mapping.
+            self.terminal_failure.lock().unwrap().get_or_insert(failure);
             self.changed.notify_waiters();
         }
     }
-    async fn wait_for_auth_rejection(&self) {
+    fn terminal_error(&self) -> Option<anyhow::Error> {
+        self.terminal_failure
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(TerminalFailure::error)
+    }
+    async fn wait_for_terminal_error(&self) -> anyhow::Error {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.auth_rejected.load(Ordering::Acquire) {
-                return;
+            if let Some(error) = self.terminal_error() {
+                return error;
             }
             changed.await;
         }
@@ -476,12 +511,12 @@ impl<B: Backend + 'static> Manager<B> {
         bytes: usize,
         deadline: Duration,
     ) -> Result<f64> {
-        if self.auth_rejected.load(Ordering::Acquire) {
-            return Err(AuthenticationRejected.into());
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
         }
         let result = self.endpoint.download(connection, bytes, deadline).await;
         if let Err(error) = &result {
-            self.note_auth_error(error);
+            self.note_terminal_error(error);
         }
         result
     }
@@ -772,7 +807,7 @@ impl<B: Backend + 'static> Manager<B> {
         loop {
             tokio::select! {
                 biased;
-                _ = self.wait_for_auth_rejection() => return,
+                _ = self.wait_for_terminal_error() => return,
                 _ = tick.tick() => {},
                 _ = self.changed.notified() => {},
                 Some(result) = jobs.join_next(), if !jobs.is_empty() => {

@@ -152,10 +152,17 @@ async fn main() -> Result<()> {
 }
 
 async fn expect_ready<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<()> {
-    match read_control(reader).await? {
+    match read_control(reader)
+        .await
+        .map_err(classify_protocol_error)?
+    {
         Control::Ready => Ok(()),
+        // Expired/rejected tickets are a per-business-connection failure.
         Control::Error { message } => bail!("server rejected request: {message}"),
-        _ => bail!("unexpected server handshake response"),
+        _ => Err(terminal(
+            "protocol_mismatch",
+            "unexpected server handshake response",
+        )),
     }
 }
 
@@ -181,14 +188,22 @@ fn terminal_mapping_error(error: &anyhow::Error) -> bool {
     error.is::<TerminalMappingError>() || error.is::<AuthenticationRejected>()
 }
 
+// InvalidData identifies deterministic gRPC framing/protobuf errors. Network
+// EOF, reset and timeout remain retryable, including wrapped I/O errors.
+fn classify_protocol_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() != std::io::ErrorKind::InvalidData)
+        || error.is::<tokio::time::error::Elapsed>()
+    {
+        error
+    } else {
+        terminal("protocol_mismatch", error.to_string())
+    }
+}
+
 async fn read_policy_control<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Control> {
-    read_control(reader).await.map_err(|error| {
-        if error.is::<std::io::Error>() {
-            error
-        } else {
-            terminal("protocol_mismatch", error.to_string())
-        }
-    })
+    read_control(reader).await.map_err(classify_protocol_error)
 }
 
 // The policy lives only within this handshake and is fetched anew after every reconnect.
@@ -281,7 +296,17 @@ async fn run_mapping(
             .into(),
         }
     };
-    let mut tunnel = pool.open(hello).await?;
+    let mut tunnel = pool.open(hello).await.map_err(|error| {
+        if policy_mode
+            && error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+        {
+            classify_protocol_error(error)
+        } else {
+            error
+        }
+    })?;
     if policy_mode {
         timeout(CONNECT_TIMEOUT, policy_handshake(&mut tunnel, proxy)).await??;
     } else {
@@ -332,6 +357,7 @@ impl MappingBackend for ClientTransport {
     }
 }
 enum TransferDone {
+    Terminal(anyhow::Error),
     Tcp(String),
     Udp(u64),
 }
@@ -372,7 +398,10 @@ async fn run_session<B: MappingBackend>(
     loop {
         tokio::select! {
             frame = rx.recv() => {
-                match frame.context("tunnel reader closed")?? {
+                let frame = frame.context("tunnel reader closed")?.map_err(|error| {
+                    if policy_mode { classify_protocol_error(error) } else { error }
+                })?;
+                match frame {
                     Frame::Control(Control::Ping) => queue(&tx, Frame::Control(Control::Pong)).await?,
                     Frame::Control(Control::Pong) => {}
                     Frame::Control(Control::Open { ticket, timeout_ms }) if proxy.protocol == Protocol::Tcp => {
@@ -401,6 +430,15 @@ async fn run_session<B: MappingBackend>(
                             if let Err(error) = pool.tcp(&local, ticket.clone(), deadline, cancelled).await {
                                 debug!(error = %format!("{error:#}"), "TCP transfer ended");
                                 let _ = cancel_transfer(&failures, ticket.clone(), policy_mode).await;
+                                if policy_mode {
+                                    let error = if error.downcast_ref::<std::io::Error>()
+                                        .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData) {
+                                        classify_protocol_error(error)
+                                    } else { error };
+                                    if terminal_mapping_error(&error) {
+                                        return TransferDone::Terminal(error);
+                                    }
+                                }
                             }
                             TransferDone::Tcp(ticket)
                         });
@@ -431,11 +469,13 @@ async fn run_session<B: MappingBackend>(
                             });
                         }
                     }
+                    _ if policy_mode => return Err(terminal("protocol_mismatch", "unexpected tunnel frame")),
                     _ => bail!("unexpected tunnel frame"),
                 }
             }
             Some(result) = transfers.join_next(), if !transfers.is_empty() => {
                 match result {
+                    Ok(TransferDone::Terminal(error)) => return Err(error),
                     Ok(TransferDone::Udp(peer)) => { udp_peers.remove(&peer); }
                     Ok(TransferDone::Tcp(ticket)) => { pending.remove(&ticket); }
                     Err(error) => bail!("transfer worker failed: {error}"),

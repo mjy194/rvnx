@@ -122,6 +122,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 enum Step {
     Panic,
     AuthRejected,
+    IoFailure(io::ErrorKind),
     Speed(f64),
     Fail,
     Block(Arc<Notify>, f64),
@@ -165,6 +166,9 @@ async fn run_step(step: Step) -> Result<f64> {
     match step {
         Step::Panic => panic!("injected backend panic"),
         Step::AuthRejected => Err(AuthenticationRejected.into()),
+        Step::IoFailure(kind) => {
+            Err(io::Error::new(kind, "injected IO failure")).context("backend context")
+        }
         Step::Speed(speed) => Ok(speed),
         Step::Fail => anyhow::bail!("injected transport failure"),
         Step::BlockFail(gate) => {
@@ -1081,7 +1085,7 @@ async fn authentication_failure_discards_candidate_before_spending_probe_budget(
 
 #[tokio::test(start_paused = true)]
 async fn policy_authentication_rejection_wakes_all_waiters_and_stops_retrying() {
-    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    let manager = Manager::with_error_policy(FakeBackend::default(), test_config(), true);
     manager.endpoint.script.lock().unwrap().authentication = [Step::AuthRejected].into();
     let mut waiters = JoinSet::new();
     for _ in 0..3 {
@@ -1121,16 +1125,16 @@ async fn legacy_authentication_rejection_remains_candidate_local() {
         [Step::AuthRejected, Step::Speed(0.0)].into();
     let selected = manager.clone().select().await;
     assert_eq!(selected.len(), 1);
-    assert!(!manager.auth_rejected.load(Ordering::Acquire));
+    assert!(!manager.terminal_error().is_some());
 }
 
 #[tokio::test(start_paused = true)]
 async fn policy_network_failure_remains_retryable() {
-    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    let manager = Manager::with_error_policy(FakeBackend::default(), test_config(), true);
     manager.endpoint.script.lock().unwrap().dial_failures = [true, true].into();
     let _worker = run(&manager);
     settle().await;
-    assert!(!manager.auth_rejected.load(Ordering::Acquire));
+    assert!(!manager.terminal_error().is_some());
     advance(manager.config.retry_secs).await;
     assert!(manager.state.lock().unwrap().primary.is_some());
     assert!(manager.open(Control::Ping).await.is_ok());
@@ -1138,7 +1142,7 @@ async fn policy_network_failure_remains_retryable() {
 
 #[tokio::test(start_paused = true)]
 async fn policy_open_rejection_is_terminal_and_releases_lease() {
-    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    let manager = Manager::with_error_policy(FakeBackend::default(), test_config(), true);
     let primary = candidate(&manager, 100, 128).await;
     manager.state.lock().unwrap().primary = Some(primary.clone());
     manager.endpoint.script.lock().unwrap().opens = [Step::AuthRejected].into();
@@ -1151,7 +1155,7 @@ async fn policy_open_rejection_is_terminal_and_releases_lease() {
             .is::<AuthenticationRejected>()
     );
     assert_eq!(primary.active.load(Ordering::Relaxed), 0);
-    assert!(manager.auth_rejected.load(Ordering::Acquire));
+    assert!(manager.terminal_error().is_some());
     assert!(
         manager
             .open(Control::Ping)
@@ -1164,7 +1168,7 @@ async fn policy_open_rejection_is_terminal_and_releases_lease() {
 
 #[tokio::test(start_paused = true)]
 async fn policy_keepalive_rejection_stops_background_worker() {
-    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    let manager = Manager::with_error_policy(FakeBackend::default(), test_config(), true);
     let _worker = run(&manager);
     settle().await;
     let primary = manager.state.lock().unwrap().primary.clone().unwrap();
@@ -1189,8 +1193,97 @@ async fn policy_keepalive_rejection_stops_background_worker() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn policy_protocol_failure_wakes_waiters_with_reason_and_stops_retrying() {
+    let manager = Manager::with_error_policy(FakeBackend::default(), test_config(), true);
+    manager.endpoint.script.lock().unwrap().authentication =
+        [Step::IoFailure(io::ErrorKind::InvalidData)].into();
+    let mut waiters = JoinSet::new();
+    for _ in 0..3 {
+        let manager = manager.clone();
+        waiters.spawn(async move { manager.open(Control::Ping).await });
+    }
+    settle().await;
+    let worker = run(&manager);
+    settle().await;
+    assert!(worker.0.is_finished());
+    while let Some(result) = waiters.join_next().await {
+        let error = result.unwrap().err().expect("protocol must fail");
+        let io_error = error.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            io_error
+                .to_string()
+                .contains("backend context: injected IO failure")
+        );
+    }
+    let attempts = manager.endpoint.script.lock().unwrap().addresses.len();
+    advance(300).await;
+    assert_eq!(
+        manager.endpoint.script.lock().unwrap().addresses.len(),
+        attempts
+    );
+    assert_eq!(manager.probe_bytes.load(Ordering::Relaxed), 0);
+    // A later failure cannot replace the original diagnostic.
+    manager.note_terminal_error(&AuthenticationRejected.into());
+    let error = manager.open(Control::Ping).await.err().unwrap();
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn policy_protocol_open_failure_is_latched_and_releases_lease() {
+    let manager = Manager::with_error_policy(FakeBackend::default(), test_config(), true);
+    let primary = candidate(&manager, 100, 128).await;
+    manager.state.lock().unwrap().primary = Some(primary.clone());
+    manager.endpoint.script.lock().unwrap().opens = [
+        Step::IoFailure(io::ErrorKind::InvalidData),
+        Step::Speed(0.0),
+    ]
+    .into();
+    for _ in 0..2 {
+        let error = manager.open(Control::Ping).await.err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(format!("{error:#}").contains("backend context: injected IO failure"));
+    }
+    assert_eq!(primary.active.load(Ordering::Relaxed), 0);
+    assert_eq!(manager.endpoint.script.lock().unwrap().opens.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn policy_transient_download_io_errors_retry_but_legacy_invalid_data_is_candidate_local() {
+    for kind in [
+        io::ErrorKind::UnexpectedEof,
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::TimedOut,
+    ] {
+        let manager = Manager::with_error_policy(FakeBackend::default(), test_config(), true);
+        manager.endpoint.script.lock().unwrap().authentication =
+            [Step::IoFailure(kind), Step::IoFailure(kind)].into();
+        let _worker = run(&manager);
+        settle().await;
+        assert!(manager.terminal_error().is_none());
+        assert!(manager.state.lock().unwrap().primary.is_none());
+        advance(manager.config.retry_secs).await;
+        assert!(manager.open(Control::Ping).await.is_ok());
+    }
+    let manager = Manager::new(FakeBackend::default(), test_config());
+    manager.endpoint.script.lock().unwrap().authentication = [
+        Step::IoFailure(io::ErrorKind::InvalidData),
+        Step::Speed(0.0),
+    ]
+    .into();
+    assert_eq!(manager.clone().select().await.len(), 1);
+    assert!(manager.terminal_error().is_none());
+}
+
+#[tokio::test(start_paused = true)]
 async fn outer_establishment_timeout_cancels_capacity_wait_without_leaking_a_lease() {
-    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    let manager = Manager::with_error_policy(FakeBackend::default(), test_config(), true);
     let primary = candidate(&manager, 100, 3).await; // One business slot, two reserved.
     manager.state.lock().unwrap().primary = Some(primary.clone());
     let held = manager.acquire(true).await;

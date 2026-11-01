@@ -87,6 +87,12 @@ async fn grpc_rejects_http_status_content_type_encoding_and_header_status() {
             .await
             .unwrap_err();
         assert!(error.to_string().contains(expected), "{error:#}");
+        if matches!(expected, "content type" | "encoding") {
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
     }
 }
 
@@ -519,5 +525,17 @@ async fn multiple_tokens_authenticate_every_route_on_the_same_connection() {
             .unwrap();
         let (response, _send) = sender.send_request(request, true).unwrap();
         assert_eq!(response.await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[test]
+fn malformed_grpc_status_is_protocol_error_not_operational_failure() {
+    for value in ["", "bad", "+0", "-1", "17", "999999999999999999999999"] {
+        let error = grpc_status_success(&HeaderValue::from_str(value).unwrap()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+    assert!(grpc_status_success(&HeaderValue::from_static("0")).unwrap());
+    for value in ["1", "8", "14", "16"] {
+        assert!(!grpc_status_success(&HeaderValue::from_str(value).unwrap()).unwrap());
     }
 }

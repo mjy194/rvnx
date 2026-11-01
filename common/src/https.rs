@@ -103,6 +103,24 @@ impl H2Stream {
     }
 }
 
+fn grpc_status_success(status: &HeaderValue) -> io::Result<bool> {
+    let raw = status.as_bytes();
+    if raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid gRPC status",
+        ));
+    }
+    let code = status.to_str().ok().and_then(|s| s.parse::<u32>().ok());
+    match code {
+        Some(code @ 0..=16) => Ok(code == 0),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid gRPC status",
+        )),
+    }
+}
+
 impl AsyncRead for H2Stream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -120,14 +138,19 @@ impl AsyncRead for H2Stream {
                     if self.check_trailers {
                         let trailers =
                             ready!(self.recv.poll_trailers(cx)).map_err(io::Error::other)?;
-                        if trailers
-                            .as_ref()
-                            .and_then(|h| h.get("grpc-status"))
-                            .is_none_or(|v| v != "0")
-                        {
-                            return Poll::Ready(Err(io::Error::other(
-                                "missing or unsuccessful gRPC status",
-                            )));
+                        match trailers.as_ref().and_then(|h| h.get("grpc-status")) {
+                            None => {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "missing gRPC status",
+                                )));
+                            }
+                            Some(status) if !grpc_status_success(status)? => {
+                                return Poll::Ready(Err(io::Error::other(
+                                    "unsuccessful gRPC status",
+                                )));
+                            }
+                            _ => {}
                         }
                     }
                     self.eof = true;
@@ -387,22 +410,31 @@ impl HttpsTransport {
             "gRPC request rejected ({})",
             response.status()
         );
-        ensure!(
-            response
-                .headers()
-                .get("content-type")
-                .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc")),
-            "invalid gRPC response content type"
-        );
-        ensure!(
-            response
-                .headers()
-                .get("grpc-encoding")
-                .is_none_or(|v| v == "identity"),
-            "unsupported gRPC encoding"
-        );
+        if !response
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid gRPC response content type",
+            )
+            .into());
+        }
+        if response
+            .headers()
+            .get("grpc-encoding")
+            .is_some_and(|v| v != "identity")
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "unsupported gRPC encoding").into(),
+            );
+        }
         if let Some(status) = response.headers().get("grpc-status") {
-            ensure!(status == "0", "gRPC request failed ({status:?})");
+            ensure!(
+                grpc_status_success(status)?,
+                "gRPC request failed ({status:?})"
+            );
         }
         let mut stream = H2Stream::new(response.into_body(), send);
         stream.closed = end;
@@ -452,9 +484,19 @@ impl HttpsTransport {
                     break;
                 }
                 received += n;
-                ensure!(received <= bytes, "probe returned excess payload");
+                if received > bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "probe returned excess payload",
+                    )
+                    .into());
+                }
             }
-            ensure!(received == bytes, "incomplete probe payload");
+            if received != bytes {
+                return Err(
+                    io::Error::new(io::ErrorKind::InvalidData, "incomplete probe payload").into(),
+                );
+            }
             Ok(received as f64 * 8.0 / start.elapsed().as_secs_f64() / 1_000_000.0)
         })
         .await

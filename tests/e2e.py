@@ -11,6 +11,7 @@ import http.server
 import h2.config
 import h2.connection
 import h2.events
+import h2.exceptions
 import os
 from pathlib import Path
 import signal
@@ -813,6 +814,84 @@ local = "127.0.0.1:{local_port}"
         retry, _ = self.policy_tunnel()
         with retry:
             self.policy_register(retry, "budget", self.tcp_port)
+
+    def policy_scripted_peer(self, malformed):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(self.directory / "cert.pem"), str(self.directory / "key.pem"))
+        context.set_alpn_protocols(["h2"])
+        class MalformedHandler(socketserver.BaseRequestHandler):
+            def handle(handler):
+                try:
+                    with context.wrap_socket(handler.request, server_side=True) as sock:
+                        sock.settimeout(5)
+                        connection = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False))
+                        connection.initiate_connection()
+                        sock.sendall(connection.data_to_send())
+                        healthy = {}
+                        def respond(stream_id, message):
+                            frame = b"\x01" + json.dumps(message).encode()
+                            connection.send_data(stream_id, struct.pack("!I", len(frame)) + frame)
+                        while data := sock.recv(65536):
+                            for event in connection.receive_data(data):
+                                if isinstance(event, h2.events.RequestReceived):
+                                    with handler.server.request_lock:
+                                        handler.server.requests += 1
+                                        malformed_response = handler.server.requests == 1
+                                    connection.send_headers(event.stream_id,
+                                        [(":status", "200"), ("content-type", "application/octet-stream")])
+                                    if malformed_response:
+                                        connection.send_data(event.stream_id, handler.server.malformed)
+                                    else:
+                                        healthy[event.stream_id] = bytearray()
+                                elif isinstance(event, h2.events.DataReceived) and event.stream_id in healthy:
+                                    buffer = healthy[event.stream_id]
+                                    buffer.extend(event.data)
+                                    connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                                    while len(buffer) >= 4:
+                                        length = struct.unpack("!I", buffer[:4])[0]
+                                        if len(buffer) < length + 4:
+                                            break
+                                        message = json.loads(bytes(buffer[5:4+length]))
+                                        del buffer[:4+length]
+                                        if message["type"] == "get_policy":
+                                            respond(event.stream_id, {"type": "policy", "version": 3,
+                                                "policy": {"bind_ip": "127.0.0.1", "protocols": ["tcp"],
+                                                    "allowed_ports": [{"start": 1, "end": 65535}], "max_mappings": 4}})
+                                        elif message["type"] == "register_policy":
+                                            respond(event.stream_id, {"type": "registered", "proxy": message["proxy"],
+                                                "protocol": message["protocol"], "remote_port": message["remote_port"]})
+                                        elif message["type"] == "ping":
+                                            respond(event.stream_id, {"type": "pong"})
+                            sock.sendall(connection.data_to_send())
+                except (OSError, ssl.SSLError, h2.exceptions.H2Error):
+                    pass
+        peer = EchoTCP(("127.0.0.1", 0), MalformedHandler)
+        peer.malformed = malformed
+        peer.requests, peer.request_lock = 0, threading.Lock()
+        self.echo_servers.append(peer)
+        threading.Thread(target=peer.serve_forever, daemon=True).start()
+        return peer
+
+    def test_policy_malformed_control_response_is_terminal_not_network_retry(self):
+        self.stop(self.client)
+        for malformed in (struct.pack("!I", 1) + b"\x7f",
+                          struct.pack("!I", 2) + b"\x01{"):
+            with self.subTest(malformed=malformed):
+                peer = self.policy_scripted_peer(malformed=malformed)
+                self.write_policy_client([("first", "tcp", self.tcp_port), ("second", "tcp", self.tcp_port)])
+                config = self.directory / "clnt.toml"
+                config.write_text(config.read_text().replace(
+                    f'server = "127.0.0.1:{self.control_port}"',
+                    f'server = "127.0.0.1:{peer.server_address[1]}"'))
+                log = self.directory / f"rvnx-clnt-{len(self.processes)}.log"
+                self.client = self.start("rvnx-clnt", "clnt.toml")
+                self.wait_for(lambda: "mapping stopped; configuration must be corrected" in log.read_text()
+                              and "mapping connected" in log.read_text())
+                time.sleep(1.2)
+                self.assertIsNone(self.client.poll(), "one malformed response must not stop another mapping")
+                self.assertEqual(log.read_text().count("mapping stopped; configuration must be corrected"), 1)
+                self.assertEqual(peer.requests, 2, "malformed data must not cause a reconnect loop")
+                self.stop(self.client)
 
     def test_policy_ticket_owner_cancel_scope_and_disconnect_cleanup(self):
         self.enable_policy()

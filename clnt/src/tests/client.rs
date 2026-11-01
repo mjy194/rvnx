@@ -142,6 +142,11 @@ impl MappingBackend for SessionBackend {
         self.events.send(ticket.clone()).unwrap();
         match ticket.as_str() {
             "panic" => panic!("injected transfer panic"),
+            "invalid-data" => Err(std::io::Error::from(std::io::ErrorKind::InvalidData).into()),
+            "reset" => Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into()),
+            "eof" => Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
+            "auth" => Err(AuthenticationRejected.into()),
+            "protocol" => Err(terminal("protocol_mismatch", "unexpected Attach reply")),
             "hold" => std::future::pending().await,
             "cancel-one" | "cancel-two" => {
                 cancelled.unwrap().await.unwrap();
@@ -647,6 +652,55 @@ async fn establishment_deadline_does_not_limit_established_transfer_or_legacy() 
 }
 
 #[tokio::test]
+async fn malformed_grpc_policy_is_terminal_but_network_io_remains_retryable() {
+    use rvnx_common::grpc::GrpcStream;
+    use tokio::io::AsyncWriteExt;
+    for bytes in [
+        vec![1, 0, 0, 0, 0],       // unsupported compression
+        vec![0, 0, 1, 0, 0],       // oversized protobuf record
+        vec![0, 0, 0, 0, 1, 0x80], // invalid protobuf
+    ] {
+        let (client, mut server) = tokio::io::duplex(4096);
+        server.write_all(&bytes).await.unwrap();
+        let error = read_policy_control(&mut GrpcStream::new(client))
+            .await
+            .unwrap_err();
+        assert!(terminal_mapping_error(&error));
+    }
+    for kind in [
+        std::io::ErrorKind::UnexpectedEof,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::BrokenPipe,
+    ] {
+        assert!(!terminal_mapping_error(&classify_protocol_error(
+            std::io::Error::from(kind).into()
+        )));
+    }
+}
+
+#[tokio::test]
+async fn deterministic_session_protocol_errors_stop_policy_mapping_only() {
+    use tokio::io::AsyncWriteExt;
+    for policy_mode in [false, true] {
+        for malformed in [false, true] {
+            let (proxy, backend, _) = session_fixture(Protocol::Tcp);
+            let (client, mut server) = tokio::io::duplex(4096);
+            let worker = tokio::spawn(async move {
+                run_session(&proxy, backend, Box::new(client), None, policy_mode).await
+            });
+            if malformed {
+                server.write_all(&[0, 0, 0, 1, 99]).await.unwrap();
+            } else {
+                send_control(&mut server, Control::Ready).await.unwrap();
+            }
+            let error = worker.await.unwrap().unwrap_err();
+            assert_eq!(terminal_mapping_error(&error), policy_mode);
+        }
+    }
+}
+
+#[tokio::test]
 async fn server_cancel_only_interrupts_pending_establishment() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (client, _server) = tokio::io::duplex(4096);
@@ -758,4 +812,100 @@ async fn expired_policy_transfer_does_not_wait_for_full_cancel_queue() {
         Some(Frame::Control(Control::Ping))
     ));
     assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn attach_handshake_classifies_protocol_errors_but_not_expired_tickets() {
+    for (reply, terminal_error) in [
+        (Control::Pong, true),
+        (
+            Control::Error {
+                message: "invalid or expired ticket".into(),
+            },
+            false,
+        ),
+    ] {
+        let mut bytes = Vec::new();
+        send_control(&mut bytes, reply).await.unwrap();
+        assert_eq!(
+            terminal_mapping_error(&expect_ready(&mut bytes.as_slice()).await.unwrap_err()),
+            terminal_error
+        );
+    }
+    let malformed = [0, 0, 0, 1, 99];
+    assert!(terminal_mapping_error(
+        &expect_ready(&mut malformed.as_slice()).await.unwrap_err()
+    ));
+}
+
+#[tokio::test]
+async fn transfer_protocol_failures_stop_only_policy_mapping_and_network_errors_stay_perflow() {
+    let (healthy_proxy, healthy_backend, _) = session_fixture(Protocol::Tcp);
+    let (healthy_client, mut healthy_server) = tokio::io::duplex(4096);
+    let healthy = tokio::spawn(async move {
+        run_session(
+            &healthy_proxy,
+            healthy_backend,
+            Box::new(healthy_client),
+            None,
+            true,
+        )
+        .await
+    });
+    for policy_mode in [false, true] {
+        for ticket in [
+            "invalid-data",
+            "auth",
+            "protocol",
+            "reset",
+            "eof",
+            "expired-ticket",
+        ] {
+            let (proxy, backend, _events) = session_fixture(Protocol::Tcp);
+            let (client, mut server) = tokio::io::duplex(4096);
+            let worker = tokio::spawn(async move {
+                run_session(&proxy, backend, Box::new(client), None, policy_mode).await
+            });
+            send_control(
+                &mut server,
+                Control::Open {
+                    ticket: ticket.into(),
+                    timeout_ms: policy_mode.then_some(1000),
+                },
+            )
+            .await
+            .unwrap();
+            if policy_mode && matches!(ticket, "invalid-data" | "auth" | "protocol") {
+                let error = timeout(Duration::from_secs(2), worker)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(terminal_mapping_error(&error));
+            } else {
+                assert!(matches!(
+                    read_control(&mut server).await.unwrap(),
+                    Control::Cancel { .. }
+                ));
+                send_control(&mut server, Control::Ping).await.unwrap();
+                assert!(matches!(
+                    read_control(&mut server).await.unwrap(),
+                    Control::Pong
+                ));
+                assert!(!worker.is_finished());
+                drop(server);
+                assert!(worker.await.unwrap().is_err());
+            }
+            send_control(&mut healthy_server, Control::Ping)
+                .await
+                .unwrap();
+            assert!(matches!(
+                read_control(&mut healthy_server).await.unwrap(),
+                Control::Pong
+            ));
+            assert!(!healthy.is_finished());
+        }
+    }
+    drop(healthy_server);
+    assert!(healthy.await.unwrap().is_err());
 }
