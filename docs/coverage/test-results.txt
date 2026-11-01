@@ -1,0 +1,42 @@
+Unit tests (fresh instrumentation after final assertion):
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Full E2E (unchanged production source, test file and application binary hashes verified before profile reuse):
+test_authentication_registration_and_ticket_rejection (__main__.RVNXTest.test_authentication_registration_and_ticket_rejection) ... ok
+test_certificate_hostname_verification (__main__.RVNXTest.test_certificate_hostname_verification) ... ok
+test_cf_failed_refills_back_off_without_continuous_probes (__main__.RVNXTest.test_cf_failed_refills_back_off_without_continuous_probes) ... ok
+test_cf_failure_promotes_standby_without_score_preemption (__main__.RVNXTest.test_cf_failure_promotes_standby_without_score_preemption) ... ok
+test_cf_grpc_download_authentication_and_wire_format (__main__.RVNXTest.test_cf_grpc_download_authentication_and_wire_format) ... ok
+test_cf_hard_budget_waits_and_existing_stream_survives (__main__.RVNXTest.test_cf_hard_budget_waits_and_existing_stream_survives) ... ok
+test_cf_sticky_rotation_preserves_stream_and_udp (__main__.RVNXTest.test_cf_sticky_rotation_preserves_stream_and_udp) ... ok
+test_cf_streaming_http_keepalive_and_ssh_survive_rotation (__main__.RVNXTest.test_cf_streaming_http_keepalive_and_ssh_survive_rotation) ... ok
+test_cf_successful_refill_does_not_wait_for_failure_retry_interval (__main__.RVNXTest.test_cf_successful_refill_does_not_wait_for_failure_retry_interval) ... ok
+test_cf_two_low_measurements_rotate_without_cutting_control (__main__.RVNXTest.test_cf_two_low_measurements_rotate_without_cutting_control) ... ok
+test_cli_check_validates_without_starting_another_listener (__main__.RVNXTest.test_cli_check_validates_without_starting_another_listener) ... ok
+test_client_and_server_mapping_capacity_reject_and_recover (__main__.RVNXTest.test_client_and_server_mapping_capacity_reject_and_recover) ... ok
+test_client_and_server_reconnect (__main__.RVNXTest.test_client_and_server_reconnect) ... ok
+test_connection_pool_reuse (__main__.RVNXTest.test_connection_pool_reuse) ... ok
+test_dedicated_only_does_not_create_shared_pool (__main__.RVNXTest.test_dedicated_only_does_not_create_shared_pool) ... ok
+test_default_connection_isolation_and_cleanup (__main__.RVNXTest.test_default_connection_isolation_and_cleanup) ... ok
+test_global_https_connection_capacity_recovers_after_peers_close (__main__.RVNXTest.test_global_https_connection_capacity_recovers_after_peers_close) ... ok
+test_logging_falls_back_for_missing_or_invalid_environment_filter (__main__.RVNXTest.test_logging_falls_back_for_missing_or_invalid_environment_filter) ... ok
+test_model_prefill_longer_than_control_timeout (__main__.RVNXTest.test_model_prefill_longer_than_control_timeout) ... ok
+test_model_streams_with_independent_connections (__main__.RVNXTest.test_model_streams_with_independent_connections) ... ok
+test_per_mapping_opt_out_of_multiplexing (__main__.RVNXTest.test_per_mapping_opt_out_of_multiplexing) ... ok
+test_shutdown_releases_active_http1_and_tcp_connections (__main__.RVNXTest.test_shutdown_releases_active_http1_and_tcp_connections) ... ok
+test_slow_stream_does_not_block_shared_connection (__main__.RVNXTest.test_slow_stream_does_not_block_shared_connection) ... ok
+test_startup_errors_do_not_disturb_the_existing_service (__main__.RVNXTest.test_startup_errors_do_not_disturb_the_existing_service) ... ok
+test_tcp_large_half_close_and_concurrency (__main__.RVNXTest.test_tcp_large_half_close_and_concurrency) ... ok
+test_tls_without_h2_is_rejected_and_pool_warmup_failure_retries (__main__.RVNXTest.test_tls_without_h2_is_rejected_and_pool_warmup_failure_retries) ... ok
+test_transport_failure_is_isolated_to_one_business_connection (__main__.RVNXTest.test_transport_failure_is_isolated_to_one_business_connection) ... ok
+test_udp_multiple_peers_empty_large_and_idle (__main__.RVNXTest.test_udp_multiple_peers_empty_large_and_idle) ... ok
+test_unauthenticated_http_responses (__main__.RVNXTest.test_unauthenticated_http_responses) ... ok
+test_unavailable_backend_fails_promptly (__main__.RVNXTest.test_unavailable_backend_fails_promptly) ... ok
+Ran 30 tests in 117.500s
+OK
+
+Format check: passed
+Clippy (workspace, all targets, warnings as errors): passed

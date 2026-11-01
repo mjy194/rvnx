@@ -1,0 +1,13 @@
+syntax = "proto3";
+package rvnx;
+
+// Each message carries a bounded piece of the existing RVNX byte stream.
+message Chunk {
+  bytes data = 1;
+}
+service Tunnel {
+  rpc Connect(stream Chunk) returns (stream Chunk);
+  // Exactly one request: data contains the requested byte count as uint32 BE.
+  // Zero bytes is an authenticated end-to-end keepalive. Maximum: 16 MiB.
+  rpc Download(Chunk) returns (stream Chunk);
+}

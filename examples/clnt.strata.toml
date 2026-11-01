@@ -1,0 +1,18 @@
+server = "127.0.0.1:7000"
+server_name = "localhost"
+token = "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES"
+tls_ca = "certs/server.pem"
+reconnect_secs = 3
+multiplex = false
+
+[[proxies]]
+name = "model"
+protocol = "tcp"
+local = "127.0.0.1:8080"
+max_connections = 64
+
+[[proxies]]
+name = "ssh"
+protocol = "tcp"
+local = "127.0.0.1:22"
+max_connections = 16

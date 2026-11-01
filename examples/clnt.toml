@@ -1,0 +1,23 @@
+server = "127.0.0.1:7000"
+# Must match a DNS name or IP SAN on the server certificate.
+server_name = "localhost"
+token = "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES"
+tls_ca = "certs/server.pem"
+reconnect_secs = 3
+# Default: one fresh HTTPS/TLS connection per TCP business connection.
+multiplex = false
+# Only used when multiplex = true.
+pool_size = 4
+
+[[proxies]]
+name = "web"
+protocol = "tcp"
+local = "127.0.0.1:8000"
+max_connections = 128
+
+[[proxies]]
+name = "dns"
+protocol = "udp"
+local = "127.0.0.1:5300"
+max_connections = 128
+udp_timeout_secs = 60

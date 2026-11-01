@@ -1,0 +1,49 @@
+# Replace with your own proxied hostname. SNI and HTTP authority stay on this hostname.
+server = "tunnel.example.com:443"
+server_name = "tunnel.example.com"
+token = "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES"
+# Empty/omitted = bundled public trust roots. For local tests, supply the test CA PEM.
+tls_ca = ""
+reconnect_secs = 3
+
+# Presence of this section enables the separate CF primary/standby mode.
+# Do not combine it with multiplex=true or per-mapping transport overrides.
+[cloudflare]
+# Documentation-only IPs: replace with your own candidate CF edge IP:443 entries.
+# IPv6 is written as "[IPv6]:443". A short list can create several connections per IP.
+candidates = ["192.0.2.1:443", "192.0.2.2:443"]
+candidate_count = 6
+quick_download_mib = 4
+final_download_mib = 16
+final_samples = 2
+target_mbps = 100.0
+keepalive_secs = 12
+health_interval_secs = 300
+health_download_mib = 16
+slow_mbps = 50.0
+slow_failures = 2
+rotate_after = 80
+hard_budget = 112
+queue_timeout_secs = 60
+probe_timeout_secs = 30
+# Failure backoff only: a successful round never delays standby replenishment.
+retry_secs = 60
+# Routine refill: try the active IP first, measure the new TLS connection twice,
+# stop at the first qualified candidate. Startup still uses the full 6-candidate scan.
+refill_download_mib = 8
+refill_attempts = 2
+# Shared budget for startup, refill and health probe payloads (token bucket).
+probe_budget_mib_per_minute = 64
+probe_burst_mib = 96
+
+[[proxies]]
+name = "model"
+protocol = "tcp"
+local = "127.0.0.1:8080" # Strata; Ollama:11434 / vLLM:8000
+max_connections = 64
+
+[[proxies]]
+name = "ssh"
+protocol = "tcp"
+local = "127.0.0.1:22"
+max_connections = 16

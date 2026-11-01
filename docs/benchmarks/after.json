@@ -1,0 +1,148 @@
+{
+  "platform": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44",
+  "cpu_count": 22,
+  "binary_directory": "/home/javion/share/code/rvnx/target/release",
+  "worker_threads_per_process": 4,
+  "payload_bytes": 1024,
+  "scope": "loopback; fresh TCP per request; warmed transport; complete echo latency",
+  "results": [
+    {
+      "samples": 1000,
+      "concurrency": 1,
+      "requests_per_second": 6039.4,
+      "p50_ms": 0.145,
+      "p95_ms": 0.185,
+      "p99_ms": 0.268,
+      "mode": "direct_tcp",
+      "repetition": 1,
+      "proxy_cpu_seconds": 0.0
+    },
+    {
+      "samples": 1000,
+      "concurrency": 1,
+      "requests_per_second": 2709.2,
+      "p50_ms": 0.341,
+      "p95_ms": 0.458,
+      "p99_ms": 0.53,
+      "mode": "rvnx",
+      "repetition": 1,
+      "proxy_cpu_seconds": 0.31
+    },
+    {
+      "samples": 1000,
+      "concurrency": 32,
+      "requests_per_second": 10901.2,
+      "p50_ms": 2.324,
+      "p95_ms": 2.842,
+      "p99_ms": 3.069,
+      "mode": "direct_tcp",
+      "repetition": 1,
+      "proxy_cpu_seconds": 0.0
+    },
+    {
+      "samples": 1000,
+      "concurrency": 32,
+      "requests_per_second": 7615.2,
+      "p50_ms": 3.097,
+      "p95_ms": 6.231,
+      "p99_ms": 15.569,
+      "mode": "rvnx",
+      "repetition": 1,
+      "proxy_cpu_seconds": 0.22
+    },
+    {
+      "samples": 1000,
+      "concurrency": 1,
+      "requests_per_second": 6191.7,
+      "p50_ms": 0.142,
+      "p95_ms": 0.176,
+      "p99_ms": 0.257,
+      "mode": "direct_tcp",
+      "repetition": 2,
+      "proxy_cpu_seconds": 0.0
+    },
+    {
+      "samples": 1000,
+      "concurrency": 1,
+      "requests_per_second": 2681.6,
+      "p50_ms": 0.342,
+      "p95_ms": 0.439,
+      "p99_ms": 0.501,
+      "mode": "rvnx",
+      "repetition": 2,
+      "proxy_cpu_seconds": 0.3
+    },
+    {
+      "samples": 1000,
+      "concurrency": 32,
+      "requests_per_second": 11532.0,
+      "p50_ms": 2.205,
+      "p95_ms": 2.509,
+      "p99_ms": 2.611,
+      "mode": "direct_tcp",
+      "repetition": 2,
+      "proxy_cpu_seconds": 0.0
+    },
+    {
+      "samples": 1000,
+      "concurrency": 32,
+      "requests_per_second": 9901.3,
+      "p50_ms": 2.607,
+      "p95_ms": 3.08,
+      "p99_ms": 3.294,
+      "mode": "rvnx",
+      "repetition": 2,
+      "proxy_cpu_seconds": 0.2
+    },
+    {
+      "samples": 1000,
+      "concurrency": 1,
+      "requests_per_second": 6360.6,
+      "p50_ms": 0.139,
+      "p95_ms": 0.176,
+      "p99_ms": 0.209,
+      "mode": "direct_tcp",
+      "repetition": 3,
+      "proxy_cpu_seconds": 0.0
+    },
+    {
+      "samples": 1000,
+      "concurrency": 1,
+      "requests_per_second": 2793.7,
+      "p50_ms": 0.338,
+      "p95_ms": 0.441,
+      "p99_ms": 0.521,
+      "mode": "rvnx",
+      "repetition": 3,
+      "proxy_cpu_seconds": 0.3
+    },
+    {
+      "samples": 1000,
+      "concurrency": 32,
+      "requests_per_second": 11414.9,
+      "p50_ms": 2.225,
+      "p95_ms": 2.555,
+      "p99_ms": 2.863,
+      "mode": "direct_tcp",
+      "repetition": 3,
+      "proxy_cpu_seconds": 0.0
+    },
+    {
+      "samples": 1000,
+      "concurrency": 32,
+      "requests_per_second": 10115.0,
+      "p50_ms": 2.563,
+      "p95_ms": 2.943,
+      "p99_ms": 3.1,
+      "mode": "rvnx",
+      "repetition": 3,
+      "proxy_cpu_seconds": 0.19
+    }
+  ],
+  "cpu_model": "Intel Core Ultra 9 185H",
+  "date": "2026-10-31",
+  "binary_sha256": {
+    "rvnx-clnt": "00a5b53a4cea25def1ee4def61844bcb1b039971489650235f47527185464de7",
+    "rvnx-srv": "55d22768cb0f8705a3d235ed209dea155517b9d01b04177ddd1da2c83927e47e"
+  }
+}

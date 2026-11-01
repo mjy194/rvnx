@@ -1,0 +1,57 @@
+{
+  "note": "LLVM merged source view with instantiations hidden; zero-count displayed lines, not the LLVM summary line denominator.",
+  "files": {
+    "clnt/src/main.rs": [
+      {
+        "line": 51,
+        "source": ")?)))"
+      },
+      {
+        "line": 63,
+        "source": ")?;"
+      },
+      {
+        "line": 66,
+        "source": ")?)))"
+      },
+      {
+        "line": 117,
+        "source": "}"
+      }
+    ],
+    "common/src/cloudflare.rs": [
+      {
+        "line": 441,
+        "source": "}"
+      },
+      {
+        "line": 811,
+        "source": "}"
+      }
+    ],
+    "common/src/config.rs": [],
+    "common/src/grpc.rs": [],
+    "common/src/https.rs": [
+      {
+        "line": 167,
+        "source": "Some(Err(error)) => return Poll::Ready(Err(io::Error::other(error))),"
+      },
+      {
+        "line": 331,
+        "source": "}"
+      },
+      {
+        "line": 611,
+        "source": ")?;"
+      },
+      {
+        "line": 626,
+        "source": ")?;"
+      }
+    ],
+    "common/src/lib.rs": [],
+    "common/src/protocol.rs": [],
+    "common/src/transport.rs": [],
+    "srv/src/main.rs": []
+  }
+}

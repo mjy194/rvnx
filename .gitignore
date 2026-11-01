@@ -1,0 +1,4 @@
+/target/
+/certs/
+*.local.toml
+__pycache__/

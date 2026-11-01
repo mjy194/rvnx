@@ -1,0 +1,17 @@
+bind = "0.0.0.0:7000"
+token = "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES"
+tls_cert = "certs/server.pem"
+tls_key = "certs/server-key.pem"
+
+[[proxies]]
+name = "model"
+protocol = "tcp"
+# Place an authenticated HTTPS API gateway in front of this loopback port.
+bind = "127.0.0.1:18080"
+max_connections = 64
+
+[[proxies]]
+name = "ssh"
+protocol = "tcp"
+bind = "0.0.0.0:2222"
+max_connections = 16

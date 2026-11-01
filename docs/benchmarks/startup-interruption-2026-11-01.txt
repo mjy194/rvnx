@@ -1,0 +1,13 @@
+Initial benchmark stopped after 18 completed cells; excluded from final performance aggregates.
+Client candidates dialed just before the server started listening; CF retry backoff is 60 seconds.
+The benchmark now waits for server readiness before launching the client.
+
+2026-10-31T23:52:56.704401Z  WARN CF candidate dial failed error=Connection refused (os error 111)
+2026-10-31T23:52:56.704422Z  WARN CF candidate dial failed error=Connection refused (os error 111)
+2026-10-31T23:52:56.704424Z  WARN CF candidate dial failed error=Connection refused (os error 111)
+2026-10-31T23:52:56.704425Z  WARN CF candidate dial failed error=Connection refused (os error 111)
+2026-10-31T23:52:56.704426Z  WARN CF candidate dial failed error=Connection refused (os error 111)
+2026-10-31T23:53:56.704650Z  WARN mapping disconnected; reconnecting proxy=ssh error=Cloudflare connection capacity/budget wait timed out: deadline has elapsed
+2026-10-31T23:53:56.704680Z  WARN mapping disconnected; reconnecting proxy=model error=Cloudflare connection capacity/budget wait timed out: deadline has elapsed
+2026-10-31T23:53:56.704701Z  WARN mapping disconnected; reconnecting proxy=bulk error=Cloudflare connection capacity/budget wait timed out: deadline has elapsed
+2026-10-31T23:52:56.704477Z  INFO RVNX server listening (HTTPS) bind=127.0.0.1:33931

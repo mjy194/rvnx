@@ -1,0 +1,1 @@
+No LLVM coverage hash-mismatch warnings in this full run.

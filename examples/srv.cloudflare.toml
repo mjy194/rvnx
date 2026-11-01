@@ -1,0 +1,22 @@
+# Cloudflare's gRPC origin must offer TLS and HTTP/2 on port 443.
+bind = "0.0.0.0:443"
+token = "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES"
+tls_cert = "/path/to/tunnel-fullchain.pem"
+tls_key = "/path/to/tunnel-key.pem"
+# Authenticated Download endpoint, disabled in the normal server configuration.
+cf_probe_enabled = true
+
+[[proxies]]
+name = "model"
+protocol = "tcp"
+bind = "127.0.0.1:18080"
+max_connections = 64
+# Allow the client's 60-second capacity wait, plus connection/handshake time.
+connection_wait_secs = 120
+
+[[proxies]]
+name = "ssh"
+protocol = "tcp"
+bind = "0.0.0.0:2222"
+max_connections = 16
+connection_wait_secs = 120

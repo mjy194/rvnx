@@ -1,0 +1,244 @@
+{
+  "tested_at": "2026-11-01T08:46:38+08:00",
+  "result": "Public SSH to home through real Cloudflare gRPC passed with a separate low-threshold functional configuration.",
+  "path": [
+    "local SSH client",
+    "168.110.44.158:2222",
+    "rvnx-srv",
+    "Nginx:443",
+    "Cloudflare",
+    "home rvnx-clnt",
+    "home 127.0.0.1:22"
+  ],
+  "server": {
+    "ssh": "ubuntu@168.110.44.158",
+    "architecture": "aarch64",
+    "directory": "/home/ubuntu/rvnx-cf-test-20261101",
+    "unit": "rvnx-srv-cf-test.service",
+    "unit_persistence": "transient system unit",
+    "origin_port": 7443,
+    "origin_public_firewall_allow_removed": true
+  },
+  "home": {
+    "hostname": "mainserver",
+    "ssh_user": "javion",
+    "architecture": "x86_64",
+    "directory": "/home/javion/rvnx-cf-test-20261101",
+    "active_config": "clnt.cf.smoke.toml",
+    "client_process": "nohup, PID in clnt.pid",
+    "log": "clnt.cf.smoke.log"
+  },
+  "tls": {
+    "client_verifies_cf_public_certificate": true,
+    "nginx_verifies_dedicated_origin_certificate": true,
+    "existing_websocket_certificate_verification": true
+  },
+  "cf_hostname": "ws.recv.dpdns.org",
+  "default_test": {
+    "target_mbps": 100,
+    "quick_download_mib": 4,
+    "final_download_mib": 16,
+    "candidate_count": 6,
+    "result": "No usable primary selected; quick downloads timed out on the original DNS-derived candidates. This does not establish that every possible Cloudflare IP fails the 100 Mbps target.",
+    "events": [
+      "2026-11-01T00:39:28.217321Z  WARN CF candidate dial failed error=connection timed out",
+      "2026-11-01T00:39:34.417031Z  WARN CF candidate dial failed error=gRPC download timed out",
+      "2026-11-01T00:39:34.417077Z  INFO CF probe budget charged connection=3 purpose=\"selection_quick\" bytes=4194304 total_bytes=4194304",
+      "2026-11-01T00:40:04.418096Z  WARN CF quick measurement failed ip=172.67.145.88:443 error=gRPC download timed out",
+      "2026-11-01T00:40:04.418127Z  INFO CF probe budget charged connection=0 purpose=\"selection_quick\" bytes=4194304 total_bytes=8388608",
+      "2026-11-01T00:40:18.216433Z  WARN mapping disconnected; reconnecting proxy=home-ssh error=Cloudflare connection capacity/budget wait timed out: deadline has elapsed",
+      "2026-11-01T00:40:34.419245Z  WARN CF quick measurement failed ip=[2606:4700:3030::ac43:9158]:443 error=gRPC download timed out",
+      "2026-11-01T00:40:34.419272Z  INFO CF probe budget charged connection=2 purpose=\"selection_quick\" bytes=4194304 total_bytes=12582912",
+      "2026-11-01T00:41:04.420567Z  WARN CF quick measurement failed ip=104.21.71.129:443 error=gRPC download timed out",
+      "2026-11-01T00:41:04.420621Z  INFO CF probe budget charged connection=5 purpose=\"selection_quick\" bytes=4194304 total_bytes=16777216",
+      "2026-11-01T00:41:21.218673Z  WARN mapping disconnected; reconnecting proxy=home-ssh error=Cloudflare connection capacity/budget wait timed out: deadline has elapsed",
+      "2026-11-01T00:41:34.421322Z  WARN CF quick measurement failed ip=[2606:4700:3031::6815:4781]:443 error=gRPC download timed out",
+      "2026-11-01T00:42:21.882694Z  INFO RVNX client stopped"
+    ]
+  },
+  "functional_config": {
+    "candidates": [
+      "104.17.0.1:443"
+    ],
+    "candidate_count": 2,
+    "quick_download_mib": 1,
+    "final_download_mib": 1,
+    "final_samples": 2,
+    "target_mbps": 1.0,
+    "keepalive_secs": 12,
+    "health_interval_secs": 300,
+    "health_download_mib": 1,
+    "slow_mbps": 0.5,
+    "slow_failures": 2,
+    "rotate_after": 80,
+    "hard_budget": 112,
+    "queue_timeout_secs": 60,
+    "probe_timeout_secs": 60,
+    "retry_secs": 60,
+    "refill_download_mib": 1,
+    "refill_attempts": 2,
+    "probe_budget_mib_per_minute": 64,
+    "probe_burst_mib": 96
+  },
+  "functional_primary": {
+    "connection_id": 0,
+    "ip": "104.17.0.1:443",
+    "conservative_mbps": 4.081025668667605
+  },
+  "functional_standby": {
+    "connection_id": 3,
+    "ip": "104.17.0.1:443",
+    "conservative_mbps": 5.3619705180290875,
+    "refill_elapsed_ms_including_one_failed_attempt": 65938
+  },
+  "fixed_candidate_diagnostics": [
+    {
+      "ip": "104.16.0.1",
+      "exit": 28,
+      "http_bytes_Bps_seconds": "200 21822 1818 12.001152",
+      "error": "curl: (28) Operation timed out after 12001 milliseconds with 21822 bytes received"
+    },
+    {
+      "ip": "104.17.0.1",
+      "exit": 0,
+      "http_bytes_Bps_seconds": "200 1048864 522688 2.006673",
+      "error": ""
+    },
+    {
+      "ip": "162.159.36.1",
+      "exit": 28,
+      "http_bytes_Bps_seconds": "000 0 0 4.002556",
+      "error": "curl: (28) Failed to connect to ws.recv.dpdns.org port 443 after 4002 ms: Timeout was reached"
+    },
+    {
+      "ip": "198.41.214.1",
+      "exit": 28,
+      "http_bytes_Bps_seconds": "000 0 0 12.002797",
+      "error": "curl: (28) Operation timed out after 12002 milliseconds with 0 bytes received"
+    },
+    {
+      "ip": "104.21.71.129",
+      "exit": 28,
+      "http_bytes_Bps_seconds": "200 34110 2841 12.003016",
+      "error": "curl: (28) Operation timed out after 12003 milliseconds with 34110 bytes received"
+    },
+    {
+      "ip": "172.67.145.88",
+      "exit": 28,
+      "http_bytes_Bps_seconds": "200 723786 60308 12.001325",
+      "error": "curl: (28) Operation timed out after 12001 milliseconds with 723786 bytes received"
+    },
+    {
+      "ip": "2606:4700:3030::ac43:9158",
+      "exit": 28,
+      "http_bytes_Bps_seconds": "200 124296 10357 12.000207",
+      "error": "curl: (28) Operation timed out after 12000 milliseconds with 124296 bytes received"
+    },
+    {
+      "ip": "2606:4700:3031::6815:4781",
+      "exit": 28,
+      "http_bytes_Bps_seconds": "200 482887 40236 12.001220",
+      "error": "curl: (28) Operation timed out after 12001 milliseconds with 482887 bytes received"
+    }
+  ],
+  "ssh_tests": [
+    {
+      "test": "concurrent_login",
+      "index": 0,
+      "passed": true,
+      "seconds": 5.486,
+      "output": "mainserver\njavion",
+      "error": ""
+    },
+    {
+      "test": "concurrent_login",
+      "index": 1,
+      "passed": true,
+      "seconds": 5.717,
+      "output": "mainserver\njavion",
+      "error": ""
+    },
+    {
+      "test": "concurrent_login",
+      "index": 2,
+      "passed": true,
+      "seconds": 5.49,
+      "output": "mainserver\njavion",
+      "error": ""
+    },
+    {
+      "test": "upload_1MiB_integrity",
+      "passed": true,
+      "bytes": 1048576,
+      "sha256": "2766758fb1fb29279f5473b7fd813820dcdf26f67e0b259b2a35958fcd4e1f43",
+      "seconds": 30.4,
+      "error": ""
+    },
+    {
+      "test": "download_1MiB_integrity",
+      "passed": true,
+      "bytes": 1048576,
+      "sha256": "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83",
+      "seconds": 9.769,
+      "error": ""
+    }
+  ],
+  "strict_host_key_verification": {
+    "host_key_alias": "192.168.11.13",
+    "matched_existing_home_known_hosts_entry": true
+  },
+  "websocket_preservation": {
+    "direct_8443": "HTTP/1.1 101 Switching Protocols",
+    "new_443": "HTTP/1.1 101 Switching Protocols"
+  },
+  "cloud_firewall": {
+    "type": "Instance-specific temporary OCI NSG",
+    "name": "rvnx-cf-test-20261101",
+    "tcp_port": 2222,
+    "sources": [
+      "113.80.25.230/32",
+      "183.23.97.170/32"
+    ],
+    "subnet_security_list_changed": false
+  },
+  "not_tested": [
+    "Public-network 80/112 rotation and failure promotion",
+    "Long-term stability",
+    "100 Mbps admission with other candidate IP lists"
+  ],
+  "source_archive_sha256": "34661cdcfc78241487b9084f915ad7a958b84b6cdc90f8233bf11d285ecd0320",
+  "client_smoke_events": [
+    "2026-11-01T00:43:15.209924Z  INFO CF probe budget charged connection=0 purpose=\"selection_quick\" bytes=1048576 total_bytes=1048576",
+    "2026-11-01T00:43:18.203434Z  INFO CF probe budget charged connection=1 purpose=\"selection_quick\" bytes=1048576 total_bytes=2097152",
+    "2026-11-01T00:44:05.559317Z  WARN mapping disconnected; reconnecting proxy=home-ssh error=Cloudflare connection capacity/budget wait timed out: deadline has elapsed",
+    "2026-11-01T00:44:18.204971Z  WARN CF quick measurement failed ip=104.17.0.1:443 error=gRPC download timed out",
+    "2026-11-01T00:44:18.205001Z  INFO CF probe budget charged connection=0 purpose=\"selection_final\" bytes=1048576 total_bytes=3145728",
+    "2026-11-01T00:44:20.163233Z  INFO CF probe budget charged connection=0 purpose=\"selection_final\" bytes=1048576 total_bytes=4194304",
+    "2026-11-01T00:44:22.218775Z  INFO CF candidate measured connection=0 ip=104.17.0.1:443 mbps=4.081025668667605",
+    "2026-11-01T00:44:22.218800Z  INFO CF primary selected; existing streams keep their connection connection=0 ip=104.17.0.1:443 mbps=4.081025668667605",
+    "2026-11-01T00:44:22.529965Z  INFO mapping connected proxy=home-ssh local=127.0.0.1:22",
+    "2026-11-01T00:44:24.741525Z  INFO CF probe budget charged connection=2 purpose=\"refill\" bytes=1048576 total_bytes=5242880",
+    "2026-11-01T00:44:37.823303Z  INFO CF TCP connection allocated connection=0 opened=1",
+    "2026-11-01T00:45:08.506793Z  INFO CF TCP connection allocated connection=0 opened=2",
+    "2026-11-01T00:45:08.512043Z  INFO CF TCP connection allocated connection=0 opened=3",
+    "2026-11-01T00:45:08.951425Z  INFO CF TCP connection allocated connection=0 opened=4",
+    "2026-11-01T00:45:14.194927Z  INFO CF TCP connection allocated connection=0 opened=5",
+    "2026-11-01T00:45:24.742625Z  WARN CF standby measurement failed connection=2 error=gRPC download timed out",
+    "2026-11-01T00:45:25.427508Z  INFO CF probe budget charged connection=3 purpose=\"refill\" bytes=1048576 total_bytes=6291456",
+    "2026-11-01T00:45:26.992012Z  INFO CF probe budget charged connection=3 purpose=\"refill\" bytes=1048576 total_bytes=7340032",
+    "2026-11-01T00:45:28.157625Z  INFO CF candidate measured connection=3 ip=104.17.0.1:443 mbps=5.3619705180290875",
+    "2026-11-01T00:45:28.157645Z  INFO CF standby refill complete connection=3 probe_bytes=3145728 elapsed_ms=65938",
+    "2026-11-01T00:45:35.884605Z  INFO CF TCP connection allocated connection=0 opened=6",
+    "2026-11-01T00:45:44.636923Z  INFO CF TCP connection allocated connection=0 opened=7"
+  ],
+  "server_events": [
+    "Started rvnx-srv-cf-test.service - /home/ubuntu/rvnx-cf-test-20261101/rvnx-srv --config /home/ubuntu/rvnx-cf-test-20261101/srv.toml.",
+    "2026-11-01T00:29:46.138595Z  INFO RVNX server listening (HTTPS) bind=0.0.0.0:7443",
+    "Stopping rvnx-srv-cf-test.service - /home/ubuntu/rvnx-cf-test-20261101/rvnx-srv --config /home/ubuntu/rvnx-cf-test-20261101/srv.toml...",
+    "rvnx-srv-cf-test.service: Deactivated successfully.",
+    "Stopped rvnx-srv-cf-test.service - /home/ubuntu/rvnx-cf-test-20261101/rvnx-srv --config /home/ubuntu/rvnx-cf-test-20261101/srv.toml.",
+    "Started rvnx-srv-cf-test.service - /home/ubuntu/rvnx-cf-test-20261101/rvnx-srv --config /home/ubuntu/rvnx-cf-test-20261101/srv.toml.",
+    "2026-11-01T00:31:55.264904Z  INFO RVNX server listening (HTTPS) bind=0.0.0.0:7443",
+    "2026-11-01T00:44:22.373604Z  INFO TCP mapping ready proxy=home-ssh bind=0.0.0.0:2222"
+  ]
+}
