@@ -518,3 +518,59 @@ fn policy_client_requires_explicit_mode_and_exact_nonzero_remote_ports() {
     client.policy_mode = false;
     assert!(client.validate().is_err());
 }
+
+#[test]
+fn server_setup_budget_defaults_and_bounds_do_not_change_policy_or_legacy_mapping_limits() {
+    let mut legacy = server_fixture();
+    assert_eq!(legacy.connection_wait_secs, 10);
+    let per_mapping: Vec<_> = legacy
+        .proxies
+        .iter()
+        .map(|proxy| proxy.connection_wait_secs)
+        .collect();
+    legacy.connection_wait_secs = 123;
+    assert!(legacy.validate().is_ok());
+    assert_eq!(
+        legacy
+            .proxies
+            .iter()
+            .map(|proxy| proxy.connection_wait_secs)
+            .collect::<Vec<_>>(),
+        per_mapping
+    );
+
+    let mut policy = legacy.clone();
+    policy.token = None;
+    policy.tokens = None;
+    policy.proxies.clear();
+    policy.policies = Some(vec![TokenPolicy {
+        token: "a".repeat(32),
+        policy: policy_fixture(),
+    }]);
+    for config in [&mut legacy, &mut policy] {
+        for (budget, valid) in [
+            (0, false),
+            (1, true),
+            (10, true),
+            (600, true),
+            (601, false),
+            (u64::MAX, false),
+        ] {
+            config.connection_wait_secs = budget;
+            assert_eq!(config.validate().is_ok(), valid);
+        }
+    }
+    assert!(
+        !serde_json::to_string(&policy.policies.as_ref().unwrap()[0].policy)
+            .unwrap()
+            .contains("connection_wait_secs")
+    );
+    let text = include_str!("../../../examples/srv.toml").replace(
+        "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES",
+        &"a".repeat(32),
+    );
+    let explicit: ServerConfig =
+        toml::from_str(&format!("connection_wait_secs = 42\n{text}")).unwrap();
+    assert_eq!(explicit.connection_wait_secs, 42);
+    assert!(explicit.validate().is_ok());
+}

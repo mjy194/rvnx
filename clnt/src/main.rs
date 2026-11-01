@@ -12,9 +12,9 @@ use rvnx_common::{
 use tokio::{
     io::copy_bidirectional,
     net::{TcpStream, UdpSocket, lookup_host},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinSet,
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 use tracing::{debug, info, warn};
 
@@ -288,7 +288,7 @@ async fn run_mapping(
         timeout(CONNECT_TIMEOUT, expect_ready(&mut tunnel)).await??;
     }
     info!(proxy = %proxy.name, local = %proxy.local, "mapping connected");
-    run_session(proxy, pool.clone(), tunnel, udp_target).await
+    run_session(proxy, pool.clone(), tunnel, udp_target, policy_mode).await
 }
 
 // Static dispatch lets tests inject transfer failures and panics while running
@@ -298,6 +298,8 @@ trait MappingBackend: Send + Sync + 'static {
         &self,
         local: &str,
         ticket: String,
+        deadline: Option<Instant>,
+        cancelled: Option<oneshot::Receiver<()>>,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
     fn udp(
         &self,
@@ -309,8 +311,14 @@ trait MappingBackend: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 impl MappingBackend for ClientTransport {
-    async fn tcp(&self, local: &str, ticket: String) -> Result<()> {
-        forward_tcp(self, local, ticket).await
+    async fn tcp(
+        &self,
+        local: &str,
+        ticket: String,
+        deadline: Option<Instant>,
+        cancelled: Option<oneshot::Receiver<()>>,
+    ) -> Result<()> {
+        forward_tcp(self, local, ticket, deadline, cancelled).await
     }
     async fn udp(
         &self,
@@ -323,11 +331,35 @@ impl MappingBackend for ClientTransport {
         forward_udp(peer, target, expiry, rx, tx).await
     }
 }
+enum TransferDone {
+    Tcp(String),
+    Udp(u64),
+}
+
+// A failed policy setup must release its slot immediately, not start another
+// queue timeout. Server expiry and the peer's local budget are the backstops.
+async fn cancel_transfer(
+    tx: &mpsc::Sender<Frame>,
+    ticket: String,
+    policy_mode: bool,
+) -> Result<()> {
+    let frame = Frame::Control(Control::Cancel { ticket });
+    if policy_mode {
+        match tx.try_send(frame) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => bail!("control writer closed"),
+        }
+    } else {
+        queue(tx, frame).await
+    }
+}
+
 async fn run_session<B: MappingBackend>(
     proxy: &ClientProxy,
     pool: Arc<B>,
     tunnel: Tunnel,
     udp_target: Option<SocketAddr>,
+    policy_mode: bool,
 ) -> Result<()> {
     let (reader, writer) = tokio::io::split(tunnel);
     let (mut rx, _reader_task) = spawn_reader(reader);
@@ -336,28 +368,47 @@ async fn run_session<B: MappingBackend>(
     tokio::pin!(heartbeat);
     let mut transfers = JoinSet::new();
     let mut udp_peers = HashMap::<u64, mpsc::Sender<Vec<u8>>>::new();
+    let mut pending = HashMap::<String, oneshot::Sender<()>>::new();
     loop {
         tokio::select! {
             frame = rx.recv() => {
                 match frame.context("tunnel reader closed")?? {
                     Frame::Control(Control::Ping) => queue(&tx, Frame::Control(Control::Pong)).await?,
                     Frame::Control(Control::Pong) => {}
-                    Frame::Control(Control::Open { ticket }) if proxy.protocol == Protocol::Tcp => {
+                    Frame::Control(Control::Open { ticket, timeout_ms }) if proxy.protocol == Protocol::Tcp => {
+                        let deadline = if policy_mode {
+                            let budget = timeout_ms.ok_or_else(|| terminal("protocol_mismatch", "policy Open is missing timeout_ms"))?;
+                            if budget > 600_000 { return Err(terminal("protocol_mismatch", "establishment budget exceeds server limit")); }
+                            Some(Instant::now().checked_add(Duration::from_millis(budget))
+                                .ok_or_else(|| terminal("protocol_mismatch", "invalid establishment budget"))?)
+                        } else { None };
                         if transfers.len() >= proxy.max_connections {
                             debug!(proxy = %proxy.name, "local TCP connection limit reached");
-                            queue(&tx, Frame::Control(Control::Cancel { ticket })).await?;
+                            cancel_transfer(&tx, ticket, policy_mode).await?;
                             continue;
                         }
+                        let cancelled = if policy_mode {
+                            let (sender, receiver) = oneshot::channel();
+                            if pending.insert(ticket.clone(), sender).is_some() {
+                                return Err(terminal("protocol_mismatch", "duplicate TCP ticket"));
+                            }
+                            Some(receiver)
+                        } else { None };
                         let pool = pool.clone();
                         let local = proxy.local.clone();
                         let failures = tx.clone();
                         transfers.spawn(async move {
-                            if let Err(error) = pool.tcp(&local, ticket.clone()).await {
+                            if let Err(error) = pool.tcp(&local, ticket.clone(), deadline, cancelled).await {
                                 debug!(error = %format!("{error:#}"), "TCP transfer ended");
-                                let _ = queue(&failures, Frame::Control(Control::Cancel { ticket })).await;
+                                let _ = cancel_transfer(&failures, ticket.clone(), policy_mode).await;
                             }
-                            None
+                            TransferDone::Tcp(ticket)
                         });
+                    }
+                    Frame::Control(Control::Cancel { ticket }) if policy_mode && proxy.protocol == Protocol::Tcp => {
+                        if let Some(cancelled) = pending.remove(&ticket) {
+                            let _ = cancelled.send(());
+                        }
                     }
                     Frame::Datagram { peer, data } if proxy.protocol == Protocol::Udp => {
                         if let Some(sender) = udp_peers.get(&peer) {
@@ -376,7 +427,7 @@ async fn run_session<B: MappingBackend>(
                                 if let Err(error) = pool.udp(peer, target, expiry, receiver, tx).await {
                                     debug!(%peer, %error, "UDP peer ended");
                                 }
-                                Some(peer)
+                                TransferDone::Udp(peer)
                             });
                         }
                     }
@@ -385,8 +436,8 @@ async fn run_session<B: MappingBackend>(
             }
             Some(result) = transfers.join_next(), if !transfers.is_empty() => {
                 match result {
-                    Ok(Some(peer)) => { udp_peers.remove(&peer); }
-                    Ok(None) => {}
+                    Ok(TransferDone::Udp(peer)) => { udp_peers.remove(&peer); }
+                    Ok(TransferDone::Tcp(ticket)) => { pending.remove(&ticket); }
                     Err(error) => bail!("transfer worker failed: {error}"),
                 }
             }
@@ -398,11 +449,68 @@ async fn run_session<B: MappingBackend>(
     }
 }
 
-async fn forward_tcp(pool: &ClientTransport, local: &str, ticket: String) -> Result<()> {
-    let mut local = timeout(CONNECT_TIMEOUT, TcpStream::connect(local)).await??;
-    local.set_nodelay(true)?;
-    let mut tunnel = pool.open(Control::Attach { ticket }).await?;
-    timeout(CONNECT_TIMEOUT, expect_ready(&mut tunnel)).await??;
+// Only establishment shares the deadline: established business transfers may
+// run arbitrarily long. Injected futures let tests model slow local connects,
+// CF capacity queues, Attach and Ready without external networks.
+async fn establish_tcp<C, O, L, T>(
+    connect: C,
+    open: O,
+    deadline: Option<Instant>,
+    cancelled: Option<oneshot::Receiver<()>>,
+) -> Result<(L, T)>
+where
+    C: std::future::Future<Output = Result<L>>,
+    O: std::future::Future<Output = Result<T>>,
+    T: tokio::io::AsyncRead + Unpin,
+{
+    let establish = async {
+        let local = connect.await?;
+        let mut tunnel = open.await?;
+        timeout(CONNECT_TIMEOUT, expect_ready(&mut tunnel)).await??;
+        Ok((local, tunnel))
+    };
+    let bounded = async {
+        if let Some(deadline) = deadline {
+            if deadline <= Instant::now() {
+                bail!("TCP establishment budget exhausted");
+            }
+            timeout_at(deadline, establish)
+                .await
+                .context("TCP establishment budget exhausted")?
+        } else {
+            establish.await
+        }
+    };
+    if let Some(mut cancelled) = cancelled {
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => bail!("TCP establishment cancelled by server"),
+            result = bounded => result,
+        }
+    } else {
+        bounded.await
+    }
+}
+
+async fn forward_tcp(
+    pool: &ClientTransport,
+    local: &str,
+    ticket: String,
+    deadline: Option<Instant>,
+    cancelled: Option<oneshot::Receiver<()>>,
+) -> Result<()> {
+    let connect = async {
+        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(local)).await??;
+        stream.set_nodelay(true)?;
+        Ok(stream)
+    };
+    let (mut local, mut tunnel) = establish_tcp(
+        connect,
+        pool.open(Control::Attach { ticket }),
+        deadline,
+        cancelled,
+    )
+    .await?;
     let (upload, download) = copy_bidirectional(&mut tunnel, &mut local).await?;
     debug!(upload, download, "TCP transfer complete");
     Ok(())

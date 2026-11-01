@@ -607,11 +607,12 @@ probe_timeout_secs = 10
                 pending.result(timeout=15)
         self.assertTrue(all(count <= 2 for _, count in self.cf_allocations()))
 
-    def policy_server_text(self, policies, probes=False):
+    def policy_server_text(self, policies, probes=False, connection_wait_secs=10):
         text = f'''bind = "127.0.0.1:{self.control_port}"
 tls_cert = {json.dumps(str(self.directory / "cert.pem"))}
 tls_key = {json.dumps(str(self.directory / "key.pem"))}
 cf_probe_enabled = {str(probes).lower()}
+connection_wait_secs = {connection_wait_secs}
 '''
         for token, policy in policies:
             text += f'''\n[[policies]]
@@ -625,13 +626,13 @@ max_mappings = {policy.get("max_mappings", 8)}
         # JSON inline object keys are valid TOML quoted keys; separators are '='.
         return text.replace("cf_probe_enabled = false\n", "")
 
-    def enable_policy(self, policies=None, probes=False):
+    def enable_policy(self, policies=None, probes=False, connection_wait_secs=10):
         self.stop(self.client)
         self.stop(self.server)
         self.policy_other_token = "other-policy-identity-" * 3
         if policies is None:
             policies = [(self.token, {}), (self.policy_other_token, {})]
-        (self.directory / "srv.toml").write_text(self.policy_server_text(policies, probes))
+        (self.directory / "srv.toml").write_text(self.policy_server_text(policies, probes, connection_wait_secs))
         self.server = self.start("rvnx-srv", "srv.toml")
         self.wait_for(lambda: self.port_open(self.control_port))
 
@@ -774,6 +775,44 @@ local = "127.0.0.1:{local_port}"
             self.assertEqual(sorted(r["type"] for r in replies), ["mapping_error", "registered"])
             self.assertEqual(sum(self.port_open(port) for port in ports), 1)
         self.wait_for(lambda: not any(self.port_open(port) for port in ports))
+
+    def test_policy_tcp_setup_budget_expires_ticket_but_not_established_stream(self):
+        self.enable_policy(connection_wait_secs=1)
+        owner, _ = self.policy_tunnel()
+        with owner:
+            self.policy_register(owner, "budget", self.tcp_port)
+            with socket.create_connection(("127.0.0.1", self.tcp_port), timeout=5) as expired:
+                opened = read_control(owner)
+                self.assertEqual(opened["type"], "open")
+                self.assertGreater(opened["timeout_ms"], 0)
+                self.assertLessEqual(opened["timeout_ms"], 1000)
+                # The server's monotonic deadline, not a late Attach, wins.
+                self.assertEqual(expired.recv(1), b"")
+                with self.tls_connection() as late:
+                    send_control(late, {"type": "attach", "ticket": opened["ticket"]})
+                    self.assertEqual(read_control(late)["type"], "error")
+            send_control(owner, {"type": "ping"})
+            reply = read_control(owner)
+            if reply["type"] == "cancel":
+                self.assertEqual(reply["ticket"], opened["ticket"])
+                reply = read_control(owner)
+            self.assertEqual(reply["type"], "pong")
+            with socket.create_connection(("127.0.0.1", self.tcp_port), timeout=5) as public:
+                opened = read_control(owner)
+                with self.tls_connection() as attached:
+                    send_control(attached, {"type": "attach", "ticket": opened["ticket"]})
+                    self.assertEqual(read_control(attached)["type"], "ready")
+                    time.sleep(1.2)
+                    public.sendall(b"after setup deadline")
+                    self.assertEqual(receive_exact(attached, 20), b"after setup deadline")
+                    attached.sendall(b"still alive")
+                    self.assertEqual(receive_exact(public, 11), b"still alive")
+            send_control(owner, {"type": "ping"})
+            self.assertEqual(read_control(owner)["type"], "pong")
+        self.wait_for(lambda: not self.port_open(self.tcp_port))
+        retry, _ = self.policy_tunnel()
+        with retry:
+            self.policy_register(retry, "budget", self.tcp_port)
 
     def test_policy_ticket_owner_cancel_scope_and_disconnect_cleanup(self):
         self.enable_policy()

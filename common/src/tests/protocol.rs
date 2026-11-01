@@ -203,3 +203,44 @@ async fn policy_control_roundtrips_are_explicit_and_preserve_legacy_wire_format(
         assert!(serde_json::from_str::<Control>(invalid).is_err());
     }
 }
+
+#[tokio::test]
+async fn open_budget_is_optional_and_legacy_encoding_is_unchanged() {
+    let legacy_json = r#"{"type":"open","ticket":"ticket"}"#;
+    let legacy: Control = serde_json::from_str(legacy_json).unwrap();
+    assert!(matches!(&legacy, Control::Open { ticket, timeout_ms: None } if ticket == "ticket"));
+    assert_eq!(serde_json::to_string(&legacy).unwrap(), legacy_json);
+    let mut bytes = Vec::new();
+    send_control(&mut bytes, legacy).await.unwrap();
+    assert_eq!(&bytes[5..], legacy_json.as_bytes());
+    assert!(matches!(
+        read_control(&mut bytes.as_slice()).await.unwrap(),
+        Control::Open {
+            timeout_ms: None,
+            ..
+        }
+    ));
+
+    for timeout_ms in [0, 1, 10000, 600000, u64::MAX] {
+        // The wire parser handles unsigned budgets; mode-specific bounds belong to the client.
+        let control = Control::Open {
+            ticket: "ticket".into(),
+            timeout_ms: Some(timeout_ms),
+        };
+        let json = serde_json::to_string(&control).unwrap();
+        assert!(json.contains(&format!("\"timeout_ms\":{timeout_ms}")));
+        let mut bytes = Vec::new();
+        send_control(&mut bytes, control).await.unwrap();
+        assert!(
+            matches!(read_control(&mut bytes.as_slice()).await.unwrap(), Control::Open { timeout_ms: Some(actual), .. } if actual == timeout_ms)
+        );
+    }
+    for invalid in [
+        r#"{"type":"open","ticket":"ticket","timeout_ms":-1}"#,
+        r#"{"type":"open","ticket":"ticket","timeout_ms":1.5}"#,
+        r#"{"type":"open","ticket":"ticket","timeout_ms":"1000"}"#,
+        r#"{"type":"open","ticket":"ticket","timeout_ms":18446744073709551616}"#,
+    ] {
+        assert!(serde_json::from_str::<Control>(invalid).is_err());
+    }
+}

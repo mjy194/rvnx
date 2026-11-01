@@ -9,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 fn policy_state() -> Arc<State> {
     Arc::new(State {
         config: ServerConfig {
+            connection_wait_secs: 10,
             bind: "127.0.0.1:7000".parse().unwrap(),
             token: None,
             tokens: None,
@@ -313,11 +314,14 @@ async fn foreign_attach_does_not_burn_ticket_and_owner_can_still_attach() {
         active: Arc::new(AtomicBool::new(true)),
     };
     let (sender, mut receiver) = oneshot::channel();
-    state
-        .tickets
-        .lock()
-        .unwrap()
-        .insert("ticket".into(), Ticket { scope, sender });
+    state.tickets.lock().unwrap().insert(
+        "ticket".into(),
+        Ticket {
+            scope,
+            sender,
+            deadline: Instant::now() + Duration::from_secs(10),
+        },
+    );
     let (mut client, server) = tokio::io::duplex(4096);
     let task = tokio::spawn(handle_tunnel(Box::new(server), state.clone(), 1));
     send_control(
@@ -379,6 +383,7 @@ async fn cancel_and_teardown_revoke_only_the_originating_mapping_tickets() {
     state.tickets.lock().unwrap().insert(
         "own".into(),
         Ticket {
+            deadline: Instant::now() + Duration::from_secs(10),
             scope: first.clone(),
             sender: own_sender,
         },
@@ -386,6 +391,7 @@ async fn cancel_and_teardown_revoke_only_the_originating_mapping_tickets() {
     state.tickets.lock().unwrap().insert(
         "other".into(),
         Ticket {
+            deadline: Instant::now() + Duration::from_secs(10),
             scope: second.clone(),
             sender: other_sender,
         },
@@ -420,6 +426,7 @@ async fn cancel_and_teardown_revoke_only_the_originating_mapping_tickets() {
     state.tickets.lock().unwrap().insert(
         "pending".into(),
         Ticket {
+            deadline: Instant::now() + Duration::from_secs(10),
             scope: first.clone(),
             sender,
         },
@@ -446,7 +453,7 @@ async fn established_data_connections_close_when_control_mapping_disconnects() {
     let mapping = mapping("active", Protocol::Tcp, free_port().await);
     let (mut control, task) = start_mapping(state.clone(), 0, &mapping).await;
     let mut public = TcpStream::connect(mapping.bind).await.unwrap();
-    let Control::Open { ticket } = read_control(&mut control).await.unwrap() else {
+    let Control::Open { ticket, .. } = read_control(&mut control).await.unwrap() else {
         panic!("expected ticket")
     };
     let (mut data, server) = tokio::io::duplex(4096);

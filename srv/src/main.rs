@@ -22,7 +22,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Semaphore, mpsc, oneshot},
     task::JoinSet,
-    time::{Instant, interval, sleep, timeout},
+    time::{Instant, interval, sleep, timeout, timeout_at},
 };
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 type Tickets = Arc<Mutex<HashMap<String, Ticket>>>;
 
 struct Ticket {
+    deadline: Instant,
     scope: MappingScope,
     sender: oneshot::Sender<Tunnel>,
 }
@@ -284,7 +285,9 @@ async fn handle_tunnel(mut tunnel: Tunnel, state: Arc<State>, owner: usize) -> R
             let entry = {
                 let mut tickets = state.tickets.lock().unwrap();
                 if tickets.get(&ticket).is_some_and(|t| {
-                    t.scope.owner == owner && t.scope.active.load(Ordering::SeqCst)
+                    t.scope.owner == owner
+                        && t.scope.active.load(Ordering::SeqCst)
+                        && Instant::now() < t.deadline
                 }) {
                     tickets.remove(&ticket)
                 } else {
@@ -294,7 +297,11 @@ async fn handle_tunnel(mut tunnel: Tunnel, state: Arc<State>, owner: usize) -> R
             let Some(entry) = entry else {
                 return reject(&mut tunnel, "invalid or expired ticket").await;
             };
-            timeout(CONNECT_TIMEOUT, send_control(&mut tunnel, Control::Ready)).await??;
+            timeout_at(entry.deadline, send_control(&mut tunnel, Control::Ready)).await??;
+            ensure!(
+                Instant::now() < entry.deadline && entry.scope.active.load(Ordering::SeqCst),
+                "data tunnel establishment expired"
+            );
             ensure!(
                 entry.sender.send(tunnel).is_ok(),
                 "public connection already closed"
@@ -365,7 +372,7 @@ async fn handle_tunnel(mut tunnel: Tunnel, state: Arc<State>, owner: usize) -> R
                     policy.map_or(state.config.bind.ip(), |p| p.bind_ip),
                     remote_port,
                 ),
-                connection_wait_secs: 10,
+                connection_wait_secs: state.config.connection_wait_secs,
                 max_connections: 128,
                 udp_timeout_secs: 60,
             };
@@ -483,6 +490,7 @@ async fn serve_tcp(
         tokio::select! {
             incoming = listener.accept() => {
                 let (stream, peer) = incoming?;
+                let deadline = Instant::now() + Duration::from_secs(mapping.connection_wait_secs);
                 if transfers.len() >= mapping.max_connections {
                     debug!(%peer, "TCP mapping connection limit reached");
                     continue;
@@ -491,7 +499,7 @@ async fn serve_tcp(
                 let scope = scope.clone();
                 let tx = tx.clone();
                 transfers.spawn(async move {
-                    if let Err(error) = forward_tcp(stream, tickets, tx, Duration::from_secs(mapping.connection_wait_secs), scope).await {
+                    if let Err(error) = forward_tcp(stream, tickets, tx, deadline, scope, policy).await {
                         debug!(%peer, error = %format!("{error:#}"), "TCP transfer ended");
                     }
                 });
@@ -522,8 +530,9 @@ async fn forward_tcp(
     mut public: TcpStream,
     tickets: Tickets,
     tx: mpsc::Sender<Frame>,
-    wait: Duration,
+    deadline: Instant,
     scope: MappingScope,
+    policy: bool,
 ) -> Result<()> {
     public.set_nodelay(true)?;
     let ticket: String = rand::random::<[u8; 32]>()
@@ -534,16 +543,53 @@ async fn forward_tcp(
     {
         let mut entries = tickets.lock().unwrap();
         ensure!(scope.active.load(Ordering::SeqCst), "mapping closed");
-        entries.insert(ticket.clone(), Ticket { scope, sender });
+        ensure!(
+            Instant::now() < deadline,
+            "data tunnel establishment timed out"
+        );
+        entries.insert(
+            ticket.clone(),
+            Ticket {
+                scope,
+                sender,
+                deadline,
+            },
+        );
     }
     let _ticket_guard = TicketGuard {
         tickets,
         ticket: ticket.clone(),
     };
-    queue(&tx, Frame::Control(Control::Open { ticket })).await?;
-    let mut tunnel = timeout(wait, receiver)
-        .await
-        .context("data tunnel timed out")??;
+    let setup = timeout_at(deadline, async {
+        // Reserve queue capacity before measuring remaining time: queue delay is
+        // part of the server's budget, never a fresh per-stage timeout.
+        let permit = tx.reserve().await.context("control writer closed")?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            remaining.as_millis() > 0,
+            "data tunnel establishment timed out"
+        );
+        permit.send(Frame::Control(Control::Open {
+            ticket: ticket.clone(),
+            timeout_ms: policy.then_some(remaining.as_millis().min(u64::MAX as u128) as u64),
+        }));
+        receiver.await.context("data tunnel cancelled")
+    })
+    .await;
+    let mut tunnel = match setup {
+        Ok(Ok(tunnel)) if Instant::now() < deadline => tunnel,
+        result => {
+            // Never await cancellation delivery past the authoritative deadline.
+            // The client's local budget remains the backstop if this queue is full.
+            if policy {
+                let _ = tx.try_send(Frame::Control(Control::Cancel { ticket }));
+            }
+            return match result {
+                Ok(Err(error)) => Err(error),
+                _ => Err(anyhow::anyhow!("data tunnel establishment timed out")),
+            };
+        }
+    };
     let (upload, download) = copy_bidirectional(&mut public, &mut tunnel).await?;
     debug!(upload, download, "TCP transfer complete");
     Ok(())
@@ -664,3 +710,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/policy.rs"]
 mod policy_tests;
+
+#[cfg(test)]
+#[path = "tests/budget.rs"]
+mod budget_tests;

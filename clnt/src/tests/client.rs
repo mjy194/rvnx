@@ -130,13 +130,24 @@ impl Drop for TransferGuard {
     }
 }
 impl MappingBackend for SessionBackend {
-    async fn tcp(&self, _: &str, ticket: String) -> Result<()> {
+    async fn tcp(
+        &self,
+        _: &str,
+        ticket: String,
+        _: Option<Instant>,
+        cancelled: Option<oneshot::Receiver<()>>,
+    ) -> Result<()> {
         self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _guard = TransferGuard(self.live.clone());
         self.events.send(ticket.clone()).unwrap();
         match ticket.as_str() {
             "panic" => panic!("injected transfer panic"),
             "hold" => std::future::pending().await,
+            "cancel-one" | "cancel-two" => {
+                cancelled.unwrap().await.unwrap();
+                self.events.send(format!("cancelled-{ticket}")).unwrap();
+                bail!("cancelled setup");
+            }
             _ => bail!("injected TCP failure"),
         }
     }
@@ -201,6 +212,7 @@ fn session(
             backend,
             Box::new(client),
             Some("127.0.0.1:1".parse().unwrap()),
+            false,
         )
         .await
     });
@@ -223,6 +235,7 @@ async fn invalid_session_frames_stop_mapping_and_cancel_active_transfers() {
             Protocol::Udp,
             Frame::Control(Control::Open {
                 ticket: "unexpected".into(),
+                timeout_ms: None,
             }),
         ),
     ] {
@@ -233,6 +246,7 @@ async fn invalid_session_frames_stop_mapping_and_cancel_active_transfers() {
                 &mut peer,
                 Control::Open {
                     ticket: "hold".into(),
+                    timeout_ms: None,
                 },
             )
             .await
@@ -264,6 +278,7 @@ async fn transfer_panic_ends_session_and_cancels_other_children() {
         &mut peer,
         Control::Open {
             ticket: "hold".into(),
+            timeout_ms: None,
         },
     )
     .await
@@ -273,6 +288,7 @@ async fn transfer_panic_ends_session_and_cancels_other_children() {
         &mut peer,
         Control::Open {
             ticket: "panic".into(),
+            timeout_ms: None,
         },
     )
     .await
@@ -297,6 +313,7 @@ async fn tcp_failure_cancels_only_its_ticket_and_keeps_control_alive() {
         &mut peer,
         Control::Open {
             ticket: "failed".into(),
+            timeout_ms: None,
         },
     )
     .await
@@ -522,4 +539,223 @@ async fn policy_protocol_errors_are_terminal_but_disconnects_are_retryable() {
             .await
             .unwrap_err()
     ));
+}
+
+#[tokio::test]
+async fn establishment_budget_is_shared_by_local_connect_queue_attach_and_ready() {
+    // Model each individual stage as pending while all other stages are ready.
+    for stalled in 0..3 {
+        let (client, mut server) = tokio::io::duplex(4096);
+        if stalled != 2 {
+            send_control(&mut server, Control::Ready).await.unwrap();
+        }
+        let connect = async {
+            if stalled == 0 {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        };
+        let open = async {
+            if stalled == 1 {
+                std::future::pending::<()>().await;
+            }
+            Ok(client)
+        };
+        let result = establish_tcp(
+            connect,
+            open,
+            Some(Instant::now() + Duration::from_millis(20)),
+            None,
+        )
+        .await;
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("budget exhausted")
+        );
+    }
+    // Local setup consumes most of the same allowance; queue waiting must not
+    // receive a fresh allowance after local setup finishes.
+    let (client, mut server) = tokio::io::duplex(4096);
+    send_control(&mut server, Control::Ready).await.unwrap();
+    let result = establish_tcp(
+        async {
+            sleep(Duration::from_millis(30)).await;
+            Ok(())
+        },
+        async {
+            sleep(Duration::from_millis(30)).await;
+            Ok(client)
+        },
+        Some(Instant::now() + Duration::from_millis(45)),
+        None,
+    )
+    .await;
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("budget exhausted")
+    );
+}
+
+#[tokio::test]
+async fn establishment_deadline_does_not_limit_established_transfer_or_legacy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client, mut server) = tokio::io::duplex(4096);
+    send_control(&mut server, Control::Ready).await.unwrap();
+    let (_, mut tunnel) = establish_tcp(
+        async { Ok(()) },
+        async { Ok(client) },
+        Some(Instant::now() + Duration::from_millis(50)),
+        None,
+    )
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(70)).await;
+    server.write_all(b"still alive").await.unwrap();
+    let mut reply = [0; 11];
+    tunnel.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"still alive");
+    let (client, mut server) = tokio::io::duplex(4096);
+    send_control(&mut server, Control::Ready).await.unwrap();
+    establish_tcp(
+        async {
+            sleep(Duration::from_millis(25)).await;
+            Ok(())
+        },
+        async { Ok(client) },
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (client, _) = tokio::io::duplex(4096);
+    assert!(
+        establish_tcp(
+            async { Ok(()) },
+            async { Ok(client) },
+            Some(Instant::now()),
+            None
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn server_cancel_only_interrupts_pending_establishment() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client, _server) = tokio::io::duplex(4096);
+    let (cancel, cancelled) = oneshot::channel();
+    cancel.send(()).unwrap();
+    let result = establish_tcp(
+        async { std::future::pending::<Result<()>>().await },
+        async { Ok(client) },
+        None,
+        Some(cancelled),
+    )
+    .await;
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("cancelled by server")
+    );
+    let (client, mut server) = tokio::io::duplex(4096);
+    send_control(&mut server, Control::Ready).await.unwrap();
+    let (cancel, cancelled) = oneshot::channel();
+    let (_, mut established) = establish_tcp(
+        async { Ok(()) },
+        async { Ok(client) },
+        None,
+        Some(cancelled),
+    )
+    .await
+    .unwrap();
+    assert!(
+        cancel.send(()).is_err(),
+        "Ready must detach cancellation before raw copy"
+    );
+    server.write_all(b"data").await.unwrap();
+    let mut data = [0; 4];
+    established.read_exact(&mut data).await.unwrap();
+    assert_eq!(&data, b"data");
+}
+
+#[tokio::test]
+async fn server_cancel_is_ticket_scoped_and_keeps_mapping_usable() {
+    let (proxy, backend, mut events) = session_fixture(Protocol::Tcp);
+    let (client, mut server) = tokio::io::duplex(4096);
+    let worker =
+        tokio::spawn(
+            async move { run_session(&proxy, backend, Box::new(client), None, true).await },
+        );
+    for ticket in ["cancel-one", "cancel-two"] {
+        send_control(
+            &mut server,
+            Control::Open {
+                ticket: ticket.into(),
+                timeout_ms: Some(1000),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.recv().await.unwrap(), ticket);
+    }
+    send_control(
+        &mut server,
+        Control::Cancel {
+            ticket: "cancel-one".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(events.recv().await.unwrap(), "cancelled-cancel-one");
+    assert!(
+        matches!(read_control(&mut server).await.unwrap(), Control::Cancel { ticket } if ticket == "cancel-one")
+    );
+    send_control(&mut server, Control::Ping).await.unwrap();
+    assert!(matches!(
+        read_control(&mut server).await.unwrap(),
+        Control::Pong
+    ));
+    assert!(
+        events.try_recv().is_err(),
+        "other ticket must remain pending"
+    );
+    assert!(!worker.is_finished());
+    send_control(
+        &mut server,
+        Control::Cancel {
+            ticket: "cancel-two".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(events.recv().await.unwrap(), "cancelled-cancel-two");
+    drop(server);
+    assert!(worker.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn expired_policy_transfer_does_not_wait_for_full_cancel_queue() {
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.send(Frame::Control(Control::Ping)).await.unwrap();
+    timeout(
+        Duration::from_millis(10),
+        cancel_transfer(&tx, "expired".into(), true),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(Frame::Control(Control::Ping))
+    ));
+    assert!(rx.try_recv().is_err());
 }

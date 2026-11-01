@@ -89,7 +89,9 @@ tokens = [
 - 客户端参考 [clnt.policy.toml](examples/clnt.policy.toml)：显式 `policy_mode = true`，每个映射指定准确的 `remote_port`。同样适用于独立 HTTPS、复用和 CF gRPC 模式。
 - token 本身就是身份，换 token 就是换身份。客户端认证后自动获取**自己的**策略，仅保留在内存，预校验后请求注册；服务端再次校验并预留配额，绑定成功才确认。
 - 同一 token 下映射名称唯一，不同 token 可以同名；同协议、绑定地址的监听端口不可重复，TCP 和 UDP 可以使用相同数字端口。绑定 IP 只能由服务端策略控制。
+- `max_mappings` 由服务端按同 token 跨客户端实时计数；本地逐映射校验不安排优先级，超额并发注册的胜出顺序不保证，其他请求明确收到 `quota_exceeded`。
 - 拒绝会明确报告映射名称、协议、端口及原因。认证/策略/注册拒绝只停止失败映射，不无限重试、不自动换端口，其他映射继续运行。网络断线后重新取策略，仍申请原端口。
+- 策略服务端顶层 `connection_wait_secs` 控制 TCP 总建连预算（默认 10 秒）；v3 Open 将剩余毫秒传给客户端，统一覆盖本地 connect、CF 排队和 Attach。Ready 后数据传输不受此预算限制；它是运行参数，不是权限 Policy。
 - 目前不做策略实时推送或热加载；修改策略需重启服务端。控制连接结束时释放监听、业务连接和待接入票据。
 
 完整四方时序、逐请求认证、v2/v3 消息字段与示例、二进制/gRPC 封装、状态顺序、错误重试与资源清理见 [通信协议](docs/protocol.md)。
@@ -106,7 +108,7 @@ cargo build --release --workspace
 
 | 参数 | 含义 | 默认值 |
 | --- | --- | --- |
-| `connection_wait_secs` | 服务端 TCP 连接等待客户端接入的秒数，CF 示例为 120 | 10 |
+| `connection_wait_secs` | 从公网 accept 到 Attach Ready 的总建连预算（1–600 秒）；静态模式每映射设置，策略模式服务端顶层设置；CF 可用 120 | 10 |
 | `cf_probe_enabled` | 服务端启用带认证的 gRPC 测速端点 | `false` |
 | `max_connections` | TCP 并发连接上限 / UDP 访客会话上限，双端各自限制 | 128 |
 | `udp_timeout_secs` | UDP 会话空闲时间，服务端每秒清理一次 | 60 |

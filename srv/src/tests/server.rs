@@ -10,6 +10,7 @@ fn test_scope() -> MappingScope {
 fn state(protocol: Protocol, bind: SocketAddr) -> Arc<State> {
     Arc::new(State {
         config: ServerConfig {
+            connection_wait_secs: 10,
             bind: "127.0.0.1:0".parse().unwrap(),
             token: Some("test".repeat(8)),
             tokens: None,
@@ -59,6 +60,7 @@ async fn invalid_initial_message_and_cancelled_ticket_are_rejected_and_removed()
             state.tickets.lock().unwrap().insert(
                 "cancelled".into(),
                 Ticket {
+                    deadline: Instant::now() + Duration::from_secs(10),
                     scope: test_scope(),
                     sender,
                 },
@@ -146,8 +148,9 @@ async fn pending_public_connection_timeout_and_cancellation_remove_ticket() {
             public,
             tickets.clone(),
             tx,
-            Duration::from_millis(50),
+            Instant::now() + Duration::from_millis(50),
             test_scope(),
+            false,
         ));
         assert!(matches!(
             rx.recv().await,

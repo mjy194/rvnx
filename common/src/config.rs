@@ -17,6 +17,9 @@ pub enum Protocol {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Total TCP setup budget for policy-created mappings; legacy mappings keep their own value.
+    #[serde(default = "default_connection_wait")]
+    pub connection_wait_secs: u64,
     pub bind: SocketAddr,
     /// Legacy single-token form; mutually exclusive with `tokens`.
     pub token: Option<String>,
@@ -257,6 +260,10 @@ impl ServerConfig {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(self.bind.port() != 0, "server port cannot be zero");
+        ensure!(
+            (1..=600).contains(&self.connection_wait_secs),
+            "connection_wait_secs must be in 1..=600"
+        );
         if let Some(policies) = &self.policies {
             ensure!(
                 self.token.is_none() && self.tokens.is_none() && self.proxies.is_empty(),

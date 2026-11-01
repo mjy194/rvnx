@@ -1187,3 +1187,33 @@ async fn policy_keepalive_rejection_stops_background_worker() {
             .is::<AuthenticationRejected>()
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn outer_establishment_timeout_cancels_capacity_wait_without_leaking_a_lease() {
+    let manager = Manager::with_auth_policy(FakeBackend::default(), test_config(), true);
+    let primary = candidate(&manager, 100, 3).await; // One business slot, two reserved.
+    manager.state.lock().unwrap().primary = Some(primary.clone());
+    let held = manager.acquire(true).await;
+    let start = Instant::now();
+    assert!(
+        timeout(Duration::from_secs(1), manager.open(attach()))
+            .await
+            .is_err()
+    );
+    assert_eq!(start.elapsed(), Duration::from_secs(1));
+    assert!(manager.config.queue_timeout_secs > 1);
+    assert_eq!(primary.active.load(Ordering::Relaxed), 1);
+    assert_eq!(primary.opened.load(Ordering::Relaxed), 1);
+    assert!(manager.endpoint.script.lock().unwrap().peers.is_empty());
+    assert_eq!(manager.endpoint.active.load(Ordering::SeqCst), 0);
+    drop(held);
+    let stream = timeout(Duration::from_secs(1), manager.open(attach()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(primary.active.load(Ordering::Relaxed), 1);
+    assert_eq!(primary.opened.load(Ordering::Relaxed), 2);
+    drop(stream);
+    assert_eq!(primary.active.load(Ordering::Relaxed), 0);
+    assert!(primary.healthy());
+}

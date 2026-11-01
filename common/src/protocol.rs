@@ -50,6 +50,9 @@ pub enum Control {
     },
     Open {
         ticket: String,
+        /// Remaining total setup budget for policy mode. Legacy v2 omits this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
     Cancel {
         ticket: String,
