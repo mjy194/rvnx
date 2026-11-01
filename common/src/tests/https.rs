@@ -193,9 +193,14 @@ async fn server_backpressure_rejects_new_streams_but_keeps_connection_usable() {
     let (a, b) = tokio::io::duplex(65536);
     let (tx, mut rx) = mpsc::channel(1);
     let server = driver(tokio::spawn(async move {
-        serve_h2(b, "test-token", tx, Some(Arc::new(Semaphore::new(0))))
-            .await
-            .unwrap();
+        serve_h2(
+            b,
+            &["test-token".into()],
+            tx,
+            Some(Arc::new(Semaphore::new(0))),
+        )
+        .await
+        .unwrap();
     }));
     let connection = client(a).await;
     let transport = endpoint(Some(1));
@@ -225,7 +230,7 @@ async fn server_backpressure_rejects_new_streams_but_keeps_connection_usable() {
 async fn unauthenticated_connection_has_an_absolute_deadline() {
     let (a, b) = tokio::io::duplex(65536);
     let (tx, _rx) = mpsc::channel(1);
-    let server = tokio::spawn(async move { serve_h2(b, "test-token", tx, None).await });
+    let server = tokio::spawn(async move { serve_h2(b, &["test-token".into()], tx, None).await });
     let connection = client(a).await;
     let mut sender = connection.sender.clone().ready().await.unwrap();
     let request = Request::builder()
@@ -416,7 +421,7 @@ async fn malformed_probe_requests_release_the_probe_permit() {
     let permits = Arc::new(Semaphore::new(1));
     let server_permits = permits.clone();
     let _server = driver(tokio::spawn(async move {
-        let _ = serve_h2(b, "test-token", tx, Some(server_permits)).await;
+        let _ = serve_h2(b, &["test-token".into()], tx, Some(server_permits)).await;
     }));
     let connection = client(a).await;
     let transport = endpoint(None);
@@ -440,5 +445,74 @@ async fn malformed_probe_requests_release_the_probe_permit() {
             .download(&connection, 0, Duration::from_secs(2))
             .await
             .unwrap();
+    }
+}
+
+#[test]
+fn authentication_accepts_each_token_and_rejects_missing_or_malformed_headers() {
+    let tokens = vec!["a".repeat(32), "b".repeat(32)];
+    for header in [
+        None,
+        Some("".into()),
+        Some("Bearer wrong".into()),
+        Some(format!("bearer {}", tokens[0])),
+        Some(format!("Bearer {} ", tokens[0])),
+        Some(format!("Bearer {}", tokens[0])),
+        Some(format!("Bearer {}", tokens[1])),
+    ] {
+        for method in ["POST", "GET"] {
+            let mut request = Request::builder().method(method);
+            if let Some(value) = &header {
+                request = request.header(AUTHORIZATION, value);
+            }
+            let request = request.body(()).unwrap();
+            let expected = method == "POST"
+                && tokens
+                    .iter()
+                    .any(|t| header.as_ref() == Some(&format!("Bearer {t}")));
+            assert_eq!(authorized(&request, &tokens), expected);
+            assert!(!authorized(&request, &[]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn multiple_tokens_authenticate_every_route_on_the_same_connection() {
+    let (a, b) = tokio::io::duplex(65536);
+    let (tx, mut rx) = mpsc::channel(8);
+    let tokens = vec!["first-token".into(), "second-token".into()];
+    let _server = driver(tokio::spawn(async move {
+        let _ = serve_h2(b, &tokens, tx, Some(Arc::new(Semaphore::new(1)))).await;
+    }));
+    let connection = client(a).await;
+    for token in ["first-token", "second-token"] {
+        let mut transport = endpoint(Some(1));
+        transport.authorization = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+        *transport.slots[0].lock().await = Some(connection.clone());
+        let stream = transport.open(Control::Ping).await.unwrap();
+        let accepted = rx.recv().await.unwrap();
+        drop((stream, accepted));
+        let stream = transport
+            .grpc_request(&connection, grpc::CONNECT_PATH, b"", false)
+            .await
+            .unwrap();
+        let accepted = rx.recv().await.unwrap();
+        drop((stream, accepted));
+        transport
+            .download(&connection, 0, Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
+    for path in [PATH, grpc::CONNECT_PATH, grpc::DOWNLOAD_PATH] {
+        let mut sender = connection.sender.clone().ready().await.unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("https://localhost{path}"))
+            .header(AUTHORIZATION, "Bearer unknown-token")
+            .header("content-type", "application/grpc+proto")
+            .body(())
+            .unwrap();
+        let (response, _send) = sender.send_request(request, true).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 }

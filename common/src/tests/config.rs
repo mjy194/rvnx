@@ -65,7 +65,7 @@ fn rejects_duplicate_names_and_weak_tokens() {
     config.proxies.push(config.proxies[0].clone());
     assert!(config.validate().is_err());
     config.proxies.pop();
-    config.token = "short".into();
+    config.token = Some("short".into());
     assert!(config.validate().is_err());
 }
 
@@ -137,7 +137,7 @@ fn token_and_proxy_identity_boundaries() {
         let mut client = client_fixture();
         client.token = token.clone();
         let mut server = server_fixture();
-        server.token = token;
+        server.token = Some(token);
         assert_eq!(client.validate().is_ok(), accepted);
         assert_eq!(server.validate().is_ok(), accepted);
     }
@@ -305,4 +305,40 @@ fn load_reports_io_and_toml_errors_and_preserves_defaults() {
     config.pool_size = 32;
     assert!(config.validate().is_ok());
     assert!(!config.multiplex_for(&config.proxies[0]));
+}
+
+#[test]
+fn server_accepts_legacy_token_or_multiple_tokens_but_not_both() {
+    let template = include_str!("../../../examples/srv.toml");
+    let legacy = "token = \"REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES\"";
+    let a = "a".repeat(32);
+    let b = "b".repeat(32);
+    for (credentials, accepted) in [
+        (format!("token = {a:?}"), true),
+        (format!("tokens = [{a:?}, {b:?}]"), true),
+        (format!("tokens = [{a:?}]"), true),
+        (String::new(), false),
+        ("tokens = []".into(), false),
+        (format!("token = {a:?}\ntokens = []"), false),
+        (format!("token = {a:?}\ntokens = [{b:?}]"), false),
+        (format!("tokens = [{a:?}, {a:?}]"), false),
+        (format!("tokens = [{a:?}, \"\"]"), false),
+        (format!("tokens = [{a:?}, \"short\"]"), false),
+        (format!("tokens = [{a:?}, {:?}]", "x".repeat(4097)), false),
+        (
+            format!("tokens = [{a:?}, {:?}]", "with spaces".repeat(4)),
+            false,
+        ),
+        (format!("tokens = [{a:?}, {:?}]", "密钥".repeat(32)), false),
+        (
+            format!("tokens = [{a:?}, \"REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES\"]"),
+            false,
+        ),
+    ] {
+        let config: ServerConfig = toml::from_str(&template.replace(legacy, &credentials)).unwrap();
+        assert_eq!(config.validate().is_ok(), accepted);
+        if accepted {
+            assert!(!config.auth_tokens().is_empty());
+        }
+    }
 }

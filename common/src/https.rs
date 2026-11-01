@@ -456,13 +456,18 @@ impl HttpsTransport {
     }
 }
 
-fn authorized(request: &Request<RecvStream>, token: &str) -> bool {
+fn authorized<B>(request: &Request<B>, tokens: &[String]) -> bool {
     let supplied = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
         .unwrap_or_default();
-    let valid = bool::from(supplied.ct_eq(token.as_bytes()));
+    // Check every credential without short-circuiting on the matching position.
+    let mut valid = subtle::Choice::from(0);
+    for token in tokens {
+        valid |= supplied.ct_eq(token.as_bytes());
+    }
+    let valid = bool::from(valid);
     valid && request.method() == http::Method::POST
 }
 
@@ -470,7 +475,7 @@ fn authorized(request: &Request<RecvStream>, token: &str) -> bool {
 pub async fn serve(
     stream: TcpStream,
     tls: TlsAcceptor,
-    token: &str,
+    tokens: &[String],
     accepted: mpsc::Sender<Tunnel>,
     probes: Option<Arc<Semaphore>>,
 ) -> Result<()> {
@@ -496,14 +501,14 @@ pub async fn serve(
         .await??;
         return Ok(());
     }
-    serve_h2(tls, token, accepted, probes).await
+    serve_h2(tls, tokens, accepted, probes).await
 }
 
 // Separate TLS establishment from HTTP/2 dispatch so backpressure and protocol
 // failures can also be exercised over deterministic in-memory connections.
 async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
-    token: &str,
+    tokens: &[String],
     accepted: mpsc::Sender<Tunnel>,
     probes: Option<Arc<Semaphore>>,
 ) -> Result<()> {
@@ -544,7 +549,7 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
             });
         let probe = grpc && path == grpc::DOWNLOAD_PATH;
         let route = path == PATH || (grpc && (!probe || probes.is_some()));
-        if !authorized(&request, token) || !route {
+        if !authorized(&request, tokens) || !route {
             let headers = Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("content-type", "text/plain; charset=utf-8")
@@ -639,7 +644,7 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin>(
 pub async fn dispatch<F, Fut>(
     stream: TcpStream,
     tls: TlsAcceptor,
-    token: String,
+    tokens: &[String],
     probes: Option<Arc<Semaphore>>,
     handler: F,
 ) -> Result<()>
@@ -648,7 +653,7 @@ where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let (tx, mut rx) = mpsc::channel(128);
-    let server = serve(stream, tls, &token, tx, probes);
+    let server = serve(stream, tls, tokens, tx, probes);
     tokio::pin!(server);
     let mut tasks = JoinSet::new();
     loop {

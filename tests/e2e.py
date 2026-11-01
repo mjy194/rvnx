@@ -607,6 +607,54 @@ probe_timeout_secs = 10
                 pending.result(timeout=15)
         self.assertTrue(all(count <= 2 for _, count in self.cf_allocations()))
 
+    def test_multiple_server_tokens_and_revocation_after_restart(self):
+        self.stop(self.client)
+        self.stop(self.server)
+        second = "second-test-token-" * 4
+        path = self.directory / "srv.toml"
+        original = path.read_text()
+        path.write_text(original.replace(f'token = "{self.token}"',
+            f'tokens = ["{self.token}", "{second}"]\ncf_probe_enabled = true'))
+        self.server = self.start("rvnx-srv", "srv.toml")
+        self.wait_for(lambda: self.port_open(self.control_port))
+        for token in [self.token, second]:
+            for route, grpc in [("/api/stream", False), ("/rvnx.Tunnel/Connect", True)]:
+                with self.tls_connection(token, path=route, grpc=grpc) as tunnel:
+                    self.assertEqual(tunnel.status, 200)
+                    if not grpc:
+                        send_control(tunnel, {"type": "attach", "ticket": "not-a-real-ticket"})
+                        self.assertIn("invalid or expired ticket", read_control(tunnel)["message"])
+            request = b"\x00\x00\x00\x00\x06\x0a\x04" + struct.pack("!I", 0)
+            with self.tls_connection(token, path="/rvnx.Tunnel/Download", payload=request, grpc=True) as tunnel:
+                self.assertEqual(tunnel.status, 200)
+                self.assertEqual(tunnel.recv(1), b"")
+                self.assertEqual(tunnel.trailers.get("grpc-status"), "0")
+        client_path = self.directory / "clnt.toml"
+        client_path.write_text(client_path.read_text().replace(self.token, second))
+        udp_registrations = self.log_text().count("mapping connected proxy=udp")
+        self.client = self.start("rvnx-clnt", "clnt.toml")
+        self.wait_for(lambda: self.port_open(self.tcp_port))
+        self.tcp_round_trip(b"second credential forwards traffic")
+        self.wait_for(lambda: self.log_text().count("mapping connected proxy=udp") > udp_registrations)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(5)
+            sock.sendto(b"second credential UDP", ("127.0.0.1", self.udp_port))
+            self.assertEqual(sock.recv(65535), b"second credential UDP")
+        self.stop(self.client)
+        self.stop(self.server)
+        path.write_text(original.replace(f'token = "{self.token}"', f'tokens = ["{second}"]\ncf_probe_enabled = true'))
+        self.server = self.start("rvnx-srv", "srv.toml")
+        self.wait_for(lambda: self.port_open(self.control_port))
+        for route, grpc in [("/api/stream", False), ("/rvnx.Tunnel/Connect", True), ("/rvnx.Tunnel/Download", True)]:
+            for token in [self.token, "", "wrong"]:
+                with self.tls_connection(token, path=route, grpc=grpc) as tunnel:
+                    self.assertEqual(tunnel.status, 404)
+        self.client = self.start("rvnx-clnt", "clnt.toml")
+        self.wait_for(lambda: self.port_open(self.tcp_port))
+        self.tcp_round_trip(b"retained credential still works")
+        self.assertNotIn(self.token, self.log_text())
+        self.assertNotIn(second, self.log_text())
+
     def test_unauthenticated_http_responses(self):
         probe = b'\x01{"type":"attach","ticket":"not-a-real-ticket"}'
         probe = struct.pack("!I", len(probe)) + probe

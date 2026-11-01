@@ -14,7 +14,9 @@ pub enum Protocol {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind: SocketAddr,
-    pub token: String,
+    /// Legacy single-token form; mutually exclusive with `tokens`.
+    pub token: Option<String>,
+    pub tokens: Option<Vec<String>>,
     pub tls_cert: String,
     pub tls_key: String,
     #[serde(default)]
@@ -141,8 +143,27 @@ fn validate_limits(limit: usize, timeout: u64) -> Result<()> {
 }
 
 impl ServerConfig {
+    /// Accepted server credentials. Call `validate` before serving requests.
+    pub fn auth_tokens(&self) -> &[String] {
+        match (&self.token, &self.tokens) {
+            (Some(token), None) => std::slice::from_ref(token),
+            (None, Some(tokens)) => tokens,
+            _ => &[],
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
-        validate_token(&self.token)?;
+        ensure!(
+            self.token.is_some() != self.tokens.is_some(),
+            "configure exactly one of token or tokens"
+        );
+        let tokens = self.auth_tokens();
+        ensure!(!tokens.is_empty(), "tokens must not be empty");
+        let mut unique = HashSet::new();
+        for token in tokens {
+            validate_token(token)?;
+            ensure!(unique.insert(token), "duplicate token in tokens");
+        }
         ensure!(!self.proxies.is_empty(), "at least one proxy is required");
         ensure!(self.bind.port() != 0, "server port cannot be zero");
         let mut names = HashSet::new();

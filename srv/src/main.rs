@@ -134,15 +134,21 @@ async fn reject(stream: &mut Tunnel, message: &str) -> Result<()> {
 }
 
 async fn handle_connection(stream: TcpStream, tls: TlsAcceptor, state: Arc<State>) -> Result<()> {
-    let token = state.config.token.clone();
-    https::dispatch(stream, tls, token, state.probes.clone(), move |tunnel| {
-        let state = state.clone();
-        async move {
-            if let Err(error) = handle_tunnel(tunnel, state).await {
-                debug!(%error, "authenticated tunnel ended");
+    let handler_state = state.clone();
+    https::dispatch(
+        stream,
+        tls,
+        state.config.auth_tokens(),
+        state.probes.clone(),
+        move |tunnel| {
+            let state = handler_state.clone();
+            async move {
+                if let Err(error) = handle_tunnel(tunnel, state).await {
+                    debug!(%error, "authenticated tunnel ended");
+                }
             }
-        }
-    })
+        },
+    )
     .await
 }
 

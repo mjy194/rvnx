@@ -1,4 +1,7 @@
 bind = "0.0.0.0:7000"
+# Keep legacy token, OR replace it with tokens = ["<secret-1>", "<secret-2>"].
+# Each secret must be distinct, 32..4096 visible ASCII bytes. Never set both fields.
+# All tokens share access to every mapping (and enabled CF probes).
 token = "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES"
 tls_cert = "certs/server.pem"
 tls_key = "certs/server-key.pem"

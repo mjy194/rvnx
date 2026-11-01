@@ -1,5 +1,8 @@
 # Cloudflare's gRPC origin must offer TLS and HTTP/2 on port 443.
 bind = "0.0.0.0:443"
+# Keep legacy token, OR replace it with tokens = ["<secret-1>", "<secret-2>"].
+# Each secret must be distinct, 32..4096 visible ASCII bytes. Never set both fields.
+# All tokens share access to every mapping (and enabled CF probes).
 token = "REPLACE_WITH_A_RANDOM_SECRET_AT_LEAST_32_BYTES"
 tls_cert = "/path/to/tunnel-fullchain.pem"
 tls_key = "/path/to/tunnel-key.pem"

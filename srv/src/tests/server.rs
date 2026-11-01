@@ -4,7 +4,8 @@ fn state(protocol: Protocol, bind: SocketAddr) -> Arc<State> {
     Arc::new(State {
         config: ServerConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
-            token: "test".repeat(8),
+            token: Some("test".repeat(8)),
+            tokens: None,
             tls_cert: String::new(),
             tls_key: String::new(),
             cf_probe_enabled: false,
