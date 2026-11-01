@@ -1097,10 +1097,54 @@ local = "127.0.0.1:{local_port}"
                 conn.close()
 
     def established_transport_connections(self):
-        # Linux-only observation: count the service's established transport sockets.
+        # /proc/net/tcp is namespace-wide. A runner's unrelated connection can
+        # use the same local port on another IP; match our complete endpoint.
         rows = Path("/proc/net/tcp").read_text().splitlines()[1:]
-        return sum(int(row.split()[1].split(":")[1], 16) == self.control_port
-                   and row.split()[3] == "01" for row in rows)
+        address = struct.unpack("=I", socket.inet_aton("127.0.0.1"))[0]
+        endpoint = f"{address:08X}:{self.control_port:04X}"
+        self.transport_socket_rows = [row for row in rows
+                                      if int(row.split()[1].split(":")[1], 16) == self.control_port]
+        return sum(row.split()[1] == endpoint and row.split()[3] == "01"
+                   for row in self.transport_socket_rows)
+
+    def transport_connection_diagnostics(self):
+        # Preserve the counted snapshot, including excluded same-port rows.
+        # Ownership is diagnostic only: an accepted-fd/table cross-read is not
+        # atomic and must not hide a genuine connection awaiting accept().
+        owned = []
+        for fd in Path(f"/proc/{self.server.pid}/fd").glob("*"):
+            try:
+                target = os.readlink(fd)
+            except FileNotFoundError:
+                continue  # A connection may close during the diagnostic scan.
+            if target.startswith("socket:["):
+                owned.append(f"{fd.name}={target}")
+        return (f"server_pid={self.server.pid} endpoint=127.0.0.1:{self.control_port} "
+                f"server_socket_fds={owned}\ncounted /proc/net/tcp snapshot:\n" +
+                "\n".join(self.transport_socket_rows))
+
+    @unittest.skipUnless(Path("/proc/net/tcp").exists(), "requires Linux socket counters")
+    def test_transport_counter_excludes_unrelated_same_port(self):
+        # Reuse transport slots so the fixture's readiness connection cannot
+        # create a transient independent business transport during this test.
+        self.enable_multiplexing(pool_size=2)
+        self.assertEqual(self.established_transport_connections(), 2,
+                         self.transport_connection_diagnostics())
+        # This socket belongs to Python, not rvnx-srv, and never connects to
+        # the transport listener. The old port-only counter falsely included it.
+        with socket.socket() as unrelated:
+            unrelated.bind(("127.0.0.2", self.control_port))
+            unrelated.connect(self.tcp_echo.server_address)
+            self.assertEqual(self.established_transport_connections(), 2,
+                             self.transport_connection_diagnostics())
+            legacy_count = sum(row.split()[3] == "01" for row in self.transport_socket_rows)
+            self.assertGreaterEqual(legacy_count, 3, "regression must exercise the old overcount")
+            # Do not hide real extra transports: wait for the server's H2
+            # response so this socket is accepted and remains open throughout.
+            with self.tls_connection():
+                self.assertEqual(self.established_transport_connections(), 3,
+                                 self.transport_connection_diagnostics())
+            self.wait_for(lambda: self.established_transport_connections() == 2)
 
     def enable_multiplexing(self, pool_size=4):
         self.stop(self.client)
@@ -1279,7 +1323,8 @@ dedicated_pool_size = 1
         path.write_text(config)
         self.client = self.start("rvnx-clnt", "clnt.toml")
         self.wait_for(lambda: self.port_open(self.tcp_port))
-        self.assertEqual(self.established_transport_connections(), 3)
+        self.assertEqual(self.established_transport_connections(), 3,
+                         self.transport_connection_diagnostics())
         self.tcp_round_trip(b"isolated pool works")
 
     def test_model_streams_with_independent_connections(self):
